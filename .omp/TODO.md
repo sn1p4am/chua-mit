@@ -47,16 +47,23 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
   - [x] **clean-room 守卫**：`crates/` 与 `spec/` 不得出现上游名或 copyleft 路径，
         本地已双向验证（当前仓库通过；守卫确实能抓到真实匹配）
 - [ ] 创建 GitHub 远端并推送（**需用户提供新令牌**）
-- [ ] ADR-0003 定稿后补 `spec/ui-v1.md` §9 附录
-- [ ] 清理仓库外临时目录（`.buildtest`、`.chua-verify`）
+- [x] `spec/ui-v1.md` §9 实现附录（ADR-0007 定稿后补充）—— 已随 v1.1.0 完成
+- [ ] 清理仓库外临时目录（`.buildtest` 已删；`.chua-verify` 属冻结的旧项目，随其归档一并处理）
 
-## M1 预备
+## M1 · 实现（干净会话进行中）
 
-- [ ] 定稿 ADR-0004（引擎与宿主的解耦方式：事件出口用 trait 还是 channel）
-- [ ] 按 ADR-0008 建立 crate 划分与依赖清单（每条附许可证据）
-- [ ] 引入 `cargo-deny`，白名单含 ADR-0008 追加的 `Unicode-3.0`
-- [ ] 写 M1 集成测试脚手架（本地 range server）
-- [ ] **以干净会话启动实现**（`CLEANROOM.md` §3）：只读 `spec/`，不得读任何 copyleft 源码
+- [x] 定稿 ADR-0004（引擎与宿主解耦：事件出口用 channel 不用 trait）
+- [~] 按 ADR-0008 建立 crate 划分与依赖清单（`crates/engine` + `crates/cli`）
+- [~] M1 集成测试脚手架（本地 range server，不引入额外依赖）
+- [x] 以干净会话启动实现（`CLEANROOM.md` §3）
+- [ ] 规格侧验收实现交付物：
+  - [ ] 自己跑 `cargo build` / `cargo test` / `clippy` / `fmt`，不只看会话的自述
+  - [ ] **重点复核**：服务器对 Range 请求返回 `200` 而不是 `206` 时，实现是否拒绝写入
+        （`spec/engine-v1.md` §6.3 —— 静默损坏文件的最危险一类错误）
+  - [ ] 复核 `done_len` 只统计已持久化字节（§7.3），而非已接收字节
+  - [ ] 复核引擎内不含任何面向用户的文案（§8.4）
+  - [ ] 复核命令注入与路径穿越：文件名净化对 `..`、`CON`、绝对路径的处理（§4.2）
+  - [ ] 填入 `CLEANROOM.md` §8 的逐文件来源表
 
 ## 已知的必须在 M5 前置处理项（来自 ADR-0007 风险表）
 
