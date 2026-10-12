@@ -168,18 +168,45 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
 | §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
 
-### 当前状态 —— 实现会话最终交接
+### 当前状态 —— 集成测试已建立，暴露真实缺陷
 
-**四条门禁全部通过**（2026-10-12，实测输出）：
+**单元测试与静态门禁**（2026-10-12，独立 target 目录实测）：
 
 ```
-cargo build                                    Finished `dev` profile in 0.10s
-cargo test -p chua-engine                      129 passed; 0 failed; 5 ignored
-cargo clippy --workspace --all-targets -D warnings   Finished, no diagnostics
-cargo fmt --all --check                        clean (no diff)
+cargo build                                          Finished
+cargo test -p chua-engine（单元）                     129 passed; 0 failed; 5 ignored
+cargo clippy --workspace --all-targets -D warnings   无诊断
+cargo fmt --all --check                              无差异
 ```
 
-**M1 未完成。P0 约六成落地。**
+**集成测试（真实 socket）**：2 passed / 4 failed，整套 **249.68 秒**。
+
+> ⚠️ **运行集成测试前必须设 `TMP`/`TEMP`**（见 P-001 复发条目）。否则 `tempfile`
+> 会在建临时目录时失败，六个测试**全部**报 `PermissionDenied ... Temp\.tmpXXXXXX` ——
+> 看起来像引擎全线崩了，实际一行引擎代码都没执行到。
+
+通过的两项：`a_server_that_answers_a_range_with_200_never_yields_a_plausible_wrong_file`、
+`an_unknown_length_source_degrades_to_a_single_sequential_request`。
+
+失败的四项：
+
+| 用例 | 现象 | 归属 |
+|---|---|---|
+| `a_multi_segment_download_…` | `common/mod.rs:411` task 1 未在 60s 内进入终态 | **引擎缺陷：下不完一个文件** |
+| `a_body_cut_short_…` | 同一行同一原因 | 同上（同一个 bug） |
+| `a_limited_transfer_…` | 同一行同一原因 | 同上（同一个 bug） |
+| `an_interrupted_download_resumes_…` | tokio `shutdown.rs:51` drop runtime | **测试自身缺陷**，非引擎 |
+
+**这是本项目最重要的一个结论**：129 个单元测试全绿，而最基础的操作
+——「多段下载一个文件」—— 根本完不成。单元测试覆盖了状态机、区间校验、durable 语义，
+但**没有一个碰过真实的 socket**。这正是坚持"先做集成测试再谈其它"的原因。
+
+**已排除**：`engine/persist.rs` 的锁纪律正确（同步方法内取锁并释放，未跨 await 持有）。
+
+**给实现会话的诊断建议**：超时断言改为打印快照（状态 / `done_len` / 各段进度与来源），
+即可区分四种修法完全不同的情形 —— 卡在 `Probing`（探测 future 不返回）／
+`Queued`（调度不发放槽位）／`Downloading` 且某段为 0（`JoinSet` 未排空，
+或 `watch` 订阅晚于取值变更）／`Downloading` 且各段已满（完成路径未触发）。
 
 **已完成且经测试**：状态机与迁移表、文件名推导与净化（按 v1.0.1 取末段）、
 元数据探测、§6.3 区间校验（`RangeVerdict` 三分法 + 穷举测试）、分段下载与按偏移写入、
