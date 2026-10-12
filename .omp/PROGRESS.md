@@ -145,12 +145,53 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 
 ## M1 进展
 
-**实现会话已启动（干净会话）**：只读 `spec/`、`CLEANROOM.md`、`.omp/`，
-明确禁止读写任何 copyleft 源码。任务书要求 P0 优先——
-工作区骨架 + 任务状态机 + 探测 + 分段下载 + 持久化与续传 + 事件出口 + 本地 range server 集成测试，
-并要求**必须覆盖「服务器对 Range 请求返回 200 而不是 206」**这一静默损坏场景。
+**实现会话**：干净会话（`implement-m1-engine-slice`），输入仅为 `spec/` 与 `.omp/`，
+任务书明确禁止读写任何 copyleft 目录。逐文件来源见 `CLEANROOM.md` §8。
 
-交付后由规格侧验证（本机增量编译 1.7 秒，验收成本很低），再按里程碑提交。
+### 已落地（15 个源文件，约 4700 行）
+
+`state` / `failure` / `http` / `filename` / `config` / `model` / `events` / `store` / `util` /
+`engine/{mod,job,ranges,throttle,transfer}`。
+
+### 规格侧逐行复核结论（**已确认正确**）
+
+| 规格要求 | 结论 |
+|---|---|
+| §3.2 非法状态迁移必须报错 | `TransitionError::Illegal { from, to }`，非静默 no-op |
+| §8.2 十二类失败分类 | 与规格表逐行对应 |
+| §8.4 引擎内不得有面向用户的文案 | 干净（只有中文测试数据） |
+| §2 不变式 I1（区间不重叠且铺满） | `Coverage { overlaps, gaps, tiles() }` 可显式检查 |
+| §7.3 `done_len` 只统计已落盘字节 | `durable_len` / `durable_end` 是一等概念 |
+| §7.3(2) 重启后 `Downloading` 回到 `Queued` | `Actor::restore()` 显式应用并自我校验 |
+| §6.3 区间响应校验 | `RangeVerdict` 三分法；**传输循环无绕过路径**（唯一写入点） |
+| §9.1/§9.2 限速与测速 | 令牌桶线性补充；滑动窗口；全局取 min |
+| §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
+| §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
+
+### 当前阻塞（**交付物尚不可用**）
+
+1. **`cargo build` 失败，3 个错误**：
+   - `engine/job.rs:612` —— 把 `watch::Sender` 传给了要 `Receiver` 的地方
+   - `engine/mod.rs:287` —— **actor future 不是 `Send`**：`rusqlite::Connection` 是
+     `Send` 但**不是 `Sync`**（内部有 `RefCell`），而 `run` future 跨 await 持有 `&Actor`，
+     故 `tokio::spawn` 要求 `Actor: Sync`。修法见下方"下一步"
+   - `engine/job.rs:796` —— 多余的 `mut` 警告
+2. **`crates/cli` 尚未创建** —— 验收套件需要它才能跑（接口见 `spec/cli-v1.md`）
+3. `engine/mod.rs` 974 行、`engine/job.rs` 约 1000 行，超出 `AGENTS.md` §5 的 600 行指引
+
+### 下一步
+
+先变绿，再谈拆分。修 `Actor: Sync` 的最小改法是把 `store` 放进 `std::sync::Mutex`
+（`Mutex<T>: Sync` 当 `T: Send`，`Connection` 满足），并保持临界区短且不含 await ——
+编译器会强制这一点（guard 是 `!Send`）。然后跑四条命令，再加 CLI。
+
+### 验收工具已就绪
+
+`spec/acceptance/`（服务器 7 种模式 + 6 项检查）已自测通过。
+CLI 一落地即可 `python run.py --cli ...` 得到 M1 的真实结论。
+
+**本轮结论**：规格到实现的传递是有效的（上表 10 项全部命中），
+但**在编译通过之前这些工作的可用价值为零** —— 这一点已如实告知实现会话。
 
 ---
 
