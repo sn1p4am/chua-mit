@@ -70,9 +70,10 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
     - [ ] 端到端跑一次：起一个对 Range 请求回 `200` + 整份文件的本地服务器，
           断言引擎报错而**不是**写出一个损坏文件（等 CLI 落地后做）
   - [ ] 复核 `done_len` 只统计已持久化字节（§7.3），而非已接收字节
-  - [ ] **复核「重启后 `Downloading` 必须回到 `Queued`」这条规则在哪里落实**（§7.3 第 2 条）。
-        `store.rs` 只负责存取，该规则应由启动路径应用；确认它确实存在且有测试，
-        而不是仅仅"读回来是什么状态就是什么状态"
+  - [x] ~~复核「重启后 `Downloading` 必须回到 `Queued`」这条规则在哪里落实~~ —— **已确认**：
+        `engine/mod.rs::Actor::restore()`（`:371`）显式应用 §7.3(2)，把 `Downloading` 归一化为
+        `Queued`，`Created` 也一并重新排队，并且有一处断言消息
+        `restore skipped an illegal normalisation` 自我校验
   - [ ] 复核引擎内不含任何面向用户的文案（§8.4）
   - [ ] 复核命令注入与路径穿越：文件名净化对 `..`、`CON`、绝对路径的处理（§4.2）
   - [x] ~~复核单任务限速~~ —— **已确认支持**：`throttle.rs::effective_limit(global, per_task)`
