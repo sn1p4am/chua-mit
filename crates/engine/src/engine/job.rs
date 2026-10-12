@@ -184,6 +184,19 @@ pub enum JobReportKind {
         /// Segments that have finished.
         segments_complete: u32,
     },
+    /// §6.2 split one segment in two.
+    Split {
+        /// The layout after the split.
+        segments: Vec<SegmentState>,
+        /// The half that was already durable and is therefore finished.
+        front_id: u32,
+        /// First byte of the second half.
+        back_start: u64,
+        /// Last byte of the second half.
+        back_end: u64,
+        /// Why the segment was chosen, as a stable token.
+        reason: &'static str,
+    },
     /// The worker is exiting.
     Done,
 }
@@ -311,6 +324,42 @@ pub async fn run(mut context: WorkerContext) {
         }
     }
     context.report(JobReportKind::Done);
+}
+
+/// Take a §6.2 split into the worker's own view of the task.
+///
+/// The board has already applied it — that is where the atomicity lives, because
+/// a chunk write and a split have to be serialised against each other — so all
+/// that is left is to keep the worker's copy of the layout in step with it and
+/// to tell the actor, which is what puts the new interval in front of the host.
+///
+/// The two copies must not drift: the completeness check, the retry path and
+/// every re-plan read `record.segments`, so a layout known only to the board
+/// would make a fully split pass look unfinished and re-plan from scratch.
+fn absorb_split(
+    context: &mut WorkerContext,
+    applied: &transfer::SplitOutcome,
+    transfer_context: &TransferContext,
+) {
+    if applied.pending_moved > 0 {
+        // The second half will fetch those bytes again. Nothing has to be
+        // undone — the bytes on disk are correct — but the file should be
+        // flushed so that what is already written is confirmed before the work
+        // is repeated.
+        flush_once(&transfer_context.board, &transfer_context.file);
+    }
+    // The board's layout wins, matched by id rather than reconstructed from the
+    // plan: the two must agree on `durable_end` as well as on the intervals.
+    if let Ok(board) = context.board.lock() {
+        context.record.segments = board.snapshot_segments();
+    }
+    context.report(JobReportKind::Split {
+        segments: context.record.segments.clone(),
+        front_id: applied.front_id,
+        back_start: applied.back_start,
+        back_end: applied.back_end,
+        reason: applied.reason.as_str(),
+    });
 }
 
 /// Drop the part of the target file that no interval can vouch for.
@@ -650,6 +699,12 @@ async fn transfer_loop(
     loop {
         let layout = context.record.segments.clone();
         let (stop_tx, stop_rx) = watch::channel(false);
+        // §6.2 splits are announced on their own channel rather than returned by
+        // the pass, because a split has to reach the actor and the host as soon
+        // as it happens — the pass may run for minutes afterwards, and a host
+        // looking at the segment list should not be told about a new interval
+        // only once the whole thing is over.
+        let (split_tx, mut split_rx) = mpsc::channel(8);
         let task_limit = context.task_rate_limiter();
         let transfer_context = TransferContext {
             client: context.client.clone(),
@@ -666,6 +721,7 @@ async fn transfer_loop(
             },
             board: Arc::clone(&context.board),
             stop: stop_rx.clone(),
+            split_tx,
         };
 
         let concurrency = usize::try_from(context.config.segment_policy.max_segments).unwrap_or(1);
@@ -685,38 +741,54 @@ async fn transfer_loop(
         ));
 
         let total_len = context.record.total_len.or(probe.total_len);
-        let outcome = tokio::select! {
-            outcome = transfer::run_layout(
-                transfer_context.clone(),
-                layout.clone(),
-                total_len,
-                concurrency,
-            ) => outcome,
-            phase = context.control.changed() => {
-                // Wind the transfer down, wait for the lanes to finish their
-                // current chunk, then read the durable positions.
-                if let Err(error) = stop_tx.send(true) {
-                    tracing::trace!(?error, "stop signal had no receiver");
+        let pass = transfer::run_layout(transfer::LayoutRun {
+            context: transfer_context.clone(),
+            segments: layout.clone(),
+            total_len,
+            concurrency,
+            policy: context.config.segment_policy,
+            split: context.config.split,
+        });
+        tokio::pin!(pass);
+        // Three things can end this pass: the pass itself, a host command, and a
+        // §6.2 split. Only the first two end it — a split is a report to be
+        // absorbed and then waited past, which is why this is a loop and not one
+        // `select!`. A split must reach the actor as it happens, because the
+        // pass may run for minutes afterwards and a host watching the segment
+        // list should learn about the new interval while it is still relevant.
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut pass => break outcome,
+                Some(applied) = split_rx.recv() => {
+                    absorb_split(context, &applied, &transfer_context);
                 }
-                let _settled = transfer::run_layout(
-                    transfer_context.clone(),
-                    layout.clone(),
-                    total_len,
-                    concurrency,
-                ).await;
-                if let Err(error) = stop_tx.send(true) {
-                    tracing::trace!(?error, "stop signal had no receiver");
+                phase = context.control.changed() => {
+                    // Wind the transfer down, wait for the lanes to finish their
+                    // current chunk, then read the durable positions.
+                    if let Err(error) = stop_tx.send(true) {
+                        tracing::trace!(?error, "stop signal had no receiver");
+                    }
+                    let _settled = pass.await;
+                    if let Err(error) = stop_tx.send(true) {
+                        tracing::trace!(?error, "stop signal had no receiver");
+                    }
+                    if let Err(join_error) = flusher.await {
+                        tracing::warn!(?join_error, "flush task ended abnormally");
+                    }
+                    settle_progress(context, &transfer_context.file);
+                    return match phase {
+                        JobPhase::Stop => StepOutcome::Finished,
+                        _ => StepOutcome::Restart(TaskState::Queued),
+                    };
                 }
-                if let Err(join_error) = flusher.await {
-                    tracing::warn!(?join_error, "flush task ended abnormally");
-                }
-                settle_progress(context, &transfer_context.file);
-                return match phase {
-                    JobPhase::Stop => StepOutcome::Finished,
-                    _ => StepOutcome::Restart(TaskState::Queued),
-                };
             }
         };
+        // Absorb anything the split channel still holds. The pass is over, so no
+        // more can arrive, and leaving one behind would make the worker's layout
+        // disagree with the board's.
+        while let Ok(applied) = split_rx.try_recv() {
+            absorb_split(context, &applied, &transfer_context);
+        }
         if let Err(error) = stop_tx.send(true) {
             tracing::trace!(?error, "stop signal had no receiver");
         }
@@ -727,7 +799,16 @@ async fn transfer_loop(
         settle_progress(context, &transfer_context.file);
 
         match outcome {
-            LayoutOutcome::Finished => {
+            LayoutOutcome::Finished { segments } => {
+                // The board is the authority on the layout once a split has
+                // happened, so its final answer replaces the worker's copy. A
+                // pass with no split returns exactly what went in.
+                if !same_shape(&context.record.segments, &segments) {
+                    context.record.segments = segments;
+                    context.report(JobReportKind::Segments {
+                        segments: context.record.segments.clone(),
+                    });
+                }
                 // §4.3: a close-delimited body has just said how long the
                 // representation is. Adopt it before the completeness check,
                 // which compares against a finite interval.
@@ -940,7 +1021,10 @@ async fn flush_loop(
 }
 
 /// Flush the file and confirm the pending bytes as durable.
-fn flush_once(
+///
+/// Shared with the transfer scheduler, which has to confirm a byte an earlier
+/// lane wrote before it can make that byte the split point (§6.2).
+pub(crate) fn flush_once(
     board: &Arc<Mutex<ProgressBoard>>,
     file: &Arc<Mutex<std::fs::File>>,
 ) -> Vec<(u32, u64)> {

@@ -18,6 +18,7 @@
 pub mod job;
 pub mod persist;
 pub mod ranges;
+pub mod split;
 pub mod throttle;
 pub mod transfer;
 
@@ -191,6 +192,18 @@ impl EngineHandle {
         u32::try_from(1000 / millis).unwrap_or(1)
     }
 
+    /// How many §6.2 splits have been performed since this engine was opened,
+    /// summed over every task.
+    ///
+    /// A diagnostic. The layout is the thing that matters and the snapshot
+    /// carries it; this exists so that a host — or a test — can say "a split
+    /// happened" without having to diff two segment lists and infer it.
+    pub async fn split_count(&self) -> Result<u64, EngineError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Command::SplitCount { reply }).await?;
+        wait.await.unwrap_or(Err(EngineError::ActorGone))
+    }
+
     /// Stop the actor, flush once, and wait for it to finish.
     ///
     /// §7.2 requires a final flush on the exit path, and equally requires not
@@ -241,6 +254,9 @@ pub(crate) enum Command {
     SetGlobalRate {
         bytes_per_second: Option<u64>,
         reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    SplitCount {
+        reply: oneshot::Sender<Result<u64, EngineError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -330,6 +346,9 @@ struct Actor {
     settings: EngineSettings,
     last_event: HashMap<TaskId, Instant>,
     last_flush: HashMap<TaskId, Instant>,
+    /// How many §6.2 splits each task has performed. Live rather than persisted:
+    /// it is a diagnostic, and the layout it produced is what actually matters.
+    split_count: HashMap<TaskId, u32>,
     /// Set once a shutdown has been requested, so late worker reports are
     /// ignored rather than persisted.
     closing: bool,
@@ -365,6 +384,7 @@ impl Actor {
             settings,
             last_event: HashMap::new(),
             last_flush: HashMap::new(),
+            split_count: HashMap::new(),
             closing: false,
         })
     }
@@ -484,6 +504,16 @@ impl Actor {
                 }
             }
             Command::Report(report) => self.apply_report(*report),
+            Command::SplitCount { reply } => {
+                let total: u64 = self
+                    .split_count
+                    .values()
+                    .map(|count| u64::from(*count))
+                    .sum();
+                if reply.send(Ok(total)).is_err() {
+                    tracing::debug!("split count reply dropped before delivery");
+                }
+            }
             Command::Shutdown { reply } => {
                 self.closing = true;
                 self.shutdown().await;
@@ -903,6 +933,37 @@ impl Actor {
                 let record = self.records[&id].clone();
                 let view = self.view(&record);
                 self.emit(EngineEvent::task(EventKind::SegmentsChanged, view));
+                self.persist(id);
+            }
+            JobReportKind::Split {
+                segments,
+                front_id,
+                back_start,
+                back_end,
+                reason,
+            } => {
+                {
+                    let Some(record) = self.records.get_mut(&id) else {
+                        return;
+                    };
+                    // The board is not re-created here: a split has already been
+                    // applied to it, under its own lock, and rebuilding the
+                    // board from the record would throw away the pending counts
+                    // the lanes are still using.
+                    record.segments = segments;
+                    record.updated_at = crate::http::now_unix();
+                    self.split_count.insert(id, self.split_count.get(&id).copied().unwrap_or(0) + 1);
+                }
+                let record = self.records[&id].clone();
+                let view = self.view(&record);
+                // The detail is machine-readable and carries what the host would
+                // otherwise have to diff two segment lists to find out.
+                let detail = format!("split:{reason}:front={front_id}:back={back_start}-{back_end}");
+                self.emit(EngineEvent::task_with_detail(
+                    EventKind::SegmentsChanged,
+                    view,
+                    detail,
+                ));
                 self.persist(id);
             }
             JobReportKind::Progress {

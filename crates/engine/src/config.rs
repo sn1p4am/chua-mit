@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::engine::split::SplitPolicy;
 use crate::failure::{BackoffPolicy, Failure, FailureKind, FailureScope};
 
 /// Absolute ceiling on the per-task segment count.
@@ -25,7 +26,8 @@ pub const SINGLE_SEGMENT_UP_TO: u64 = 4 * 1024 * 1024;
 /// Segment layout rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentPolicy {
-    /// Maximum segments per task. Must be in `1..=HARD_MAX_SEGMENTS`.
+    /// Maximum segments per task, counting the ones §6.2 creates by splitting.
+    /// Must be in `1..=HARD_MAX_SEGMENTS`.
     pub max_segments: u32,
     /// Boundaries are aligned down to a multiple of this, so that splits and
     /// re-plans do not litter the file with tiny slivers.
@@ -158,6 +160,8 @@ pub struct EngineConfig {
     pub global_concurrency: usize,
     /// Segment layout rules.
     pub segment_policy: SegmentPolicy,
+    /// Whether and how a lagging segment is halved while it runs (§6.2).
+    pub split: SplitPolicy,
     /// Global transfer ceiling in bytes per second; `None` is unlimited.
     pub global_rate_limit_bps: Option<u64>,
     /// How often segment progress is written to durable storage (§7.2).
@@ -182,6 +186,7 @@ impl Default for EngineConfig {
         Self {
             global_concurrency: 3,
             segment_policy: SegmentPolicy::default(),
+            split: SplitPolicy::default(),
             global_rate_limit_bps: None,
             progress_flush_interval: Duration::from_secs(3),
             event_hz: 10,
@@ -198,6 +203,7 @@ impl EngineConfig {
     /// Reject configurations that cannot be honoured.
     pub fn validate(&self) -> Result<(), Failure> {
         self.segment_policy.validate()?;
+        self.split.validate()?;
         if self.global_concurrency == 0 {
             return Err(Failure::new(
                 FailureKind::Unknown,

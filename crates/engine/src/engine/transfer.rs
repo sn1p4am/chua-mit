@@ -6,11 +6,16 @@
 //! path to the file.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
+use crate::config::SegmentPolicy;
 use crate::engine::ranges::{RangeRequest, validate_range_response, verdict_failure};
+use crate::engine::split::{
+    LagTracker, SplitDensity, SplitPlan, SplitPolicy, SplitReason, plan_split,
+};
 use crate::engine::throttle::{SharedLimiter, pace};
 use crate::failure::{Failure, FailureKind, FailureScope};
 use crate::http::{Validators, parse_content_range};
@@ -62,6 +67,32 @@ impl SegmentPlan {
             .saturating_add(1)
             .saturating_sub(self.done)
     }
+
+    /// The interval this plan's request asks for.
+    ///
+    /// For an open-ended request (`end == u64::MAX`) the request covers "the
+    /// rest of the representation", whose size is not knowable from the request
+    /// alone. The response is then judged against what is known locally instead:
+    /// the `206` is still required to start where the interval starts, which is
+    /// the only claim the engine can check without a declared length.
+    fn request_len(&self) -> u64 {
+        if self.end == u64::MAX {
+            return u64::MAX;
+        }
+        // `done` is never past the interval's end for a plan built by
+        // `plans_for`, but the saturating subtraction costs nothing and a
+        // malformed plan must not be able to produce a huge "expected length".
+        self.end
+            .saturating_sub(self.start.saturating_add(self.done))
+            .saturating_add(1)
+    }
+
+    /// Adjust the plan to a replacement interval issued by a §6.2 split.
+    fn retarget(&mut self, start: u64, end: u64, done: u64) {
+        self.start = start;
+        self.end = end;
+        self.done = done;
+    }
 }
 
 /// Shared, concurrent progress record for one task's transfer.
@@ -75,6 +106,10 @@ pub struct ProgressBoard {
     segments: Vec<SegmentState>,
     pending: Vec<u64>,
     complete: Vec<bool>,
+    /// Highest absolute offset each lane has reached. Derived from `pending` but
+    /// kept separately because it is the value a lag detector reads before the
+    /// bytes are confirmed durable.
+    cursors: Vec<u64>,
     total_received: u64,
     completed_segments: u32,
 }
@@ -86,6 +121,7 @@ impl ProgressBoard {
             segments: segments.to_vec(),
             pending: vec![0; segments.len()],
             complete: vec![false; segments.len()],
+            cursors: segments.iter().map(|segment| segment.start).collect(),
             total_received: 0,
             completed_segments: 0,
         }
@@ -146,6 +182,9 @@ impl ProgressBoard {
                 .total_received
                 .saturating_add(absolute - durable - current);
         }
+        // The cursor tracks the lane's reach, not the task's bytes, so it moves
+        // even when the write is a re-write of bytes already counted.
+        self.cursors[index] = self.cursors[index].max(capped);
     }
 
     /// Confirm that everything written so far is durable, and return the new
@@ -177,6 +216,170 @@ impl ProgressBoard {
             self.completed_segments = self.completed_segments.saturating_add(1);
         }
     }
+
+    /// Record the absolute offset a lane has reached in its interval.
+    ///
+    /// Purely diagnostic: it is what the lag detector reads to tell a lane that
+    /// is busy from one that has stopped. It does not affect durability, which
+    /// is why a lost update here is harmless.
+    pub fn set_cursor(&mut self, id: u32, cursor: u64) {
+        if let Some(index) = self.index(id) {
+            self.cursors[index] = self.cursors[index].max(cursor);
+        }
+    }
+
+    /// The offset a lane has reached, if the segment is known.
+    pub fn cursor_for(&self, id: u32) -> Option<u64> {
+        self.index(id).map(|index| self.cursors[index])
+    }
+
+    /// Bytes on disk for this interval: the durable prefix plus what has been
+    /// written since the last flush.
+    ///
+    /// This is the number a lag detector needs. The durable count alone only
+    /// moves at a flush, so a lane that is transferring perfectly happily can
+    /// look identical to one that has hung for the length of a flush interval.
+    pub fn on_disk_for(&self, id: u32) -> Option<u64> {
+        let index = self.index(id)?;
+        Some(
+            self.segments[index]
+                .durable_len()
+                .saturating_add(self.pending[index]),
+        )
+    }
+
+    /// Bytes confirmed durable for this interval.
+    pub fn durable_bytes_for(&self, id: u32) -> u64 {
+        self.index(id)
+            .map_or(0, |index| self.segments[index].durable_len())
+    }
+
+    /// How many bytes are recorded for the whole task, durable plus pending.
+    pub fn received_total(&self) -> u64 {
+        self.total_received
+    }
+
+    /// Whether any segment *before* `id` holds bytes that are written but not
+    /// yet confirmed durable.
+    ///
+    /// A split hands the durable prefix to the first half, so the split point is
+    /// only correct once every byte an earlier lane may have written has been
+    /// confirmed. Asking first keeps the common case — nothing pending — from
+    /// forcing a file flush on every check tick.
+    pub fn pending_before(&self, id: u32) -> bool {
+        let Some(threshold) = self.index(id).map(|index| self.segments[index].start) else {
+            return false;
+        };
+        self.segments
+            .iter()
+            .enumerate()
+            .any(|(index, segment)| segment.id != id && segment.start < threshold && self.pending[index] > 0)
+    }
+
+    /// Halve one segment at its durable frontier, atomically.
+    ///
+    /// §6.2 as a mutation. Three things have to be true at once and there is no
+    /// moment at which any of them is not:
+    ///
+    /// 1. **I1 holds.** The two new intervals are the old interval split at
+    ///    `front_end + 1`, so no byte is claimed twice and none is dropped. The
+    ///    caller holds the board lock across this call, and a chunk write has to
+    ///    take the same lock to record what it wrote, so no observer — in the
+    ///    scheduler or in the actor — can see a half-applied split.
+    /// 2. **No durable progress is lost.** The first half's interval is exactly
+    ///    the bytes already durable, so it is complete on creation; it inherits
+    ///    the durability by virtue of being the same bytes, not by copying a
+    ///    watermark across. The second half starts at the next byte with nothing
+    ///    written.
+    /// 3. **The second half keeps the lane's identity.** A lane in flight is
+    ///    already fetching `[old.start, old.end]`; after the split the bytes it
+    ///    has yet to fetch are exactly the second half, so the second half takes
+    ///    the old id and the lane keeps its accounting. The first half is the
+    ///    part that is finished with, so it takes the fresh id.
+    ///
+    /// `None` means the plan could not be applied, which happens when the board
+    /// and the plan disagree about the layout — in which case doing nothing is
+    /// the only safe answer. A completed segment is refused for the same reason
+    /// the decision function refuses one: §6.2 forbids it, and this is the last
+    /// line of defence in case a lane finished between deciding and applying.
+    pub fn replace_split(&mut self, plan: &SplitPlan) -> Option<SplitOutcome> {
+        let index = self.index(plan.id)?;
+        // §6.2: a completed segment MUST NOT be split. Checked here as well as
+        // in the decision function, because a lane can complete between the two.
+        if self.complete[index] {
+            return None;
+        }
+        let segment = self.segments[index].clone();
+        // The plan has to describe the interval the board actually holds. A
+        // mismatch means the layout moved between deciding and applying, and the
+        // only safe response is to leave it alone.
+        if segment.start != plan.front_start || segment.end != plan.back_end {
+            return None;
+        }
+        if plan.front_end >= plan.back_start || plan.back_start > plan.back_end {
+            return None;
+        }
+        // The split point is the durable frontier. If the board's own watermark
+        // disagrees with the plan's the plan is stale, and applying it would
+        // hand the first half bytes it has not confirmed.
+        let durable = segment.durable_len();
+        if durable == 0 || segment.start.saturating_add(durable).saturating_sub(1) != plan.front_end {
+            return None;
+        }
+
+        let pending = self.pending[index];
+        self.segments[index].end = plan.front_end;
+        self.segments[index].durable_end = Some(plan.front_end);
+        self.pending[index] = 0;
+        self.complete[index] = true;
+        self.completed_segments = self.completed_segments.saturating_add(1);
+
+        self.segments.push(SegmentState {
+            id: plan.id,
+            start: plan.back_start,
+            end: plan.back_end,
+            durable_end: None,
+        });
+        self.pending.push(0);
+        self.complete.push(false);
+        self.cursors.push(plan.back_start);
+
+        Some(SplitOutcome {
+            front_id: self.segments[index].id,
+            front_start: plan.front_start,
+            front_end: plan.front_end,
+            back_id: plan.id,
+            back_start: plan.back_start,
+            back_end: plan.back_end,
+            pending_moved: pending,
+            reason: plan.reason,
+        })
+    }
+}
+
+/// What a successful [`ProgressBoard::replace_split`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitOutcome {
+    /// Identity of the finished first half.
+    pub front_id: u32,
+    /// First byte of the first half.
+    pub front_start: u64,
+    /// Last byte of the first half.
+    pub front_end: u64,
+    /// Identity of the second half — the id the split segment had.
+    pub back_id: u32,
+    /// First byte of the second half.
+    pub back_start: u64,
+    /// Last byte of the second half.
+    pub back_end: u64,
+    /// Bytes that were written but not yet confirmed when the split happened.
+    ///
+    /// The second half fetches them again. That is deliberate: assigning them to
+    /// the first half would mean claiming bytes the store never confirmed, and
+    /// the first half would then be "complete" over a hole.
+    pub pending_moved: u64,
+    /// Why the segment was chosen.
+    pub reason: SplitReason,
 }
 
 /// What a finished fetch attempt means for the task.
@@ -201,6 +404,12 @@ pub enum SegmentOutcome {
         /// Segment identity.
         id: u32,
     },
+    /// A §6.2 split took this interval away. Whatever was written stays written
+    /// and is accounted for; the bytes that are left belong to another lane.
+    WoundDown {
+        /// Segment identity.
+        id: u32,
+    },
 }
 
 /// Immutable context shared by every segment of one task.
@@ -222,6 +431,15 @@ pub struct TransferContext {
     pub board: Arc<Mutex<ProgressBoard>>,
     /// Stop signal. Watchers see `true` when the transfer must wind down.
     pub stop: watch::Receiver<bool>,
+    /// Where a §6.2 split is announced.
+    ///
+    /// The report goes to the worker rather than being kept inside the pass
+    /// because the worker's own copy of the layout — the one the completeness
+    /// check and every re-plan read — has to learn about the new interval, and
+    /// because the actor needs to hear about it for the host's benefit. It is a
+    /// `try_send` from the transfer path, so a full channel cannot stall a
+    /// transfer (§9.4).
+    pub split_tx: mpsc::Sender<SplitOutcome>,
 }
 
 /// Read the whole digest of a range response, deciding first whether it may be
@@ -286,7 +504,32 @@ pub async fn open_validated_body(
         )
         .not_retryable());
     }
-    Ok((response, offset, plan.remaining()))
+    Ok((response, offset, plan.request_len()))
+}
+
+/// A replacement interval the scheduler hands to a lane that is already running.
+///
+/// A §6.2 split does not stop the lane that owns the segment: the bytes that
+/// lane has yet to fetch after the split are exactly the interval of the second
+/// half, so it is told what those bytes are and carries on. The alternative —
+/// aborting the lane and starting a fresh request — throws away a live
+/// connection and whatever the response had already buffered, on the very
+/// segment that was already behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentDirective {
+    /// Carry on, but the interval is now `[start, end]` and `done` bytes of it
+    /// are already accounted for.
+    Retarget {
+        /// First byte of the new interval.
+        start: u64,
+        /// Last byte of the new interval, inclusive.
+        end: u64,
+        /// Bytes of the new interval the board already has.
+        done: u64,
+    },
+    /// Stop: the interval is no longer this lane's to fetch, and the file must
+    /// not be written to again.
+    Release,
 }
 
 /// Read one segment to completion or to a stop signal.
@@ -294,8 +537,20 @@ pub async fn open_validated_body(
 /// Cancellation safety: the body is read, written and accounted for one chunk
 /// at a time in that order. A stop between chunks leaves the file consistent
 /// with the progress board, and the store is told about it by the caller.
-pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> SegmentOutcome {
-    let id = plan.id;
+///
+/// `directives` is how a §6.2 split reaches a lane that is already in flight. It
+/// is watched on the same footing as the stop signal, so a lane blocked in
+/// `response.chunk()` still hears about it immediately — which is the whole
+/// point, because the lane being split is usually the one that is blocked.
+/// [`SegmentDirective::Release`] tells the lane to wind the rest of its interval
+/// down; that happens *after* the byte it is currently writing, so the file can
+/// never gain a byte past the interval the board is willing to account for.
+pub async fn fetch_segment(
+    context: &TransferContext,
+    mut plan: SegmentPlan,
+    mut directives: watch::Receiver<Option<SegmentDirective>>,
+) -> SegmentOutcome {
+    let mut id = plan.id;
     let (mut response, mut offset, mut remaining) = match open_validated_body(context, &plan).await
     {
         Ok(triple) => triple,
@@ -313,6 +568,27 @@ pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> Segm
         let chunk = tokio::select! {
             biased;
             () = wait_for_stop(&context.stop) => return SegmentOutcome::Stopped { id },
+            () = wait_for_directive(&mut directives) => {
+                match *directives.borrow_and_update() {
+                    // This lane is now the second half of a split: same bytes to
+                    // fetch, new interval boundaries. The remaining count is
+                    // recomputed from the interval rather than from the bytes
+                    // already taken off the socket, so a directive that shrinks
+                    // the interval mid-flight ends the lane instead of writing
+                    // past the new end.
+                    Some(SegmentDirective::Retarget { start, end, done }) => {
+                        plan.retarget(start, end, done);
+                        remaining = plan.remaining();
+                        continue;
+                    }
+                    // The interval belongs to someone else now. Winding down here
+                    // rather than aborting means the byte already in flight is
+                    // still written and still accounted for.
+                    _ => {
+                        return SegmentOutcome::WoundDown { id };
+                    }
+                }
+            }
             chunk = response.chunk() => chunk,
         };
         let chunk = match chunk {
@@ -374,6 +650,16 @@ pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> Segm
         tokio::select! {
             biased;
             () = wait_for_stop(&context.stop) => return SegmentOutcome::Stopped { id },
+            () = wait_for_directive(&mut directives) => {
+                match *directives.borrow_and_update() {
+                    Some(SegmentDirective::Retarget { start, end, done }) => {
+                        plan.retarget(start, end, done);
+                        id = plan.id;
+                        remaining = plan.remaining();
+                    }
+                    _ => return SegmentOutcome::WoundDown { id },
+                }
+            }
             () = pace(global.as_ref(), task.as_ref(), length) => {}
         }
         if let Err(failure) = write_chunk(context, id, offset, &chunk) {
@@ -381,6 +667,22 @@ pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> Segm
         }
         offset = offset.saturating_add(length);
         remaining = remaining.saturating_sub(length);
+    }
+}
+
+/// Wait until a directive is published. Returns immediately when one already is.
+async fn wait_for_directive(directives: &mut watch::Receiver<Option<SegmentDirective>>) {
+    if directives.borrow_and_update().is_some() {
+        return;
+    }
+    loop {
+        if directives.changed().await.is_err() {
+            // Every sender is gone, so the pass is over and so is this lane.
+            return;
+        }
+        if directives.borrow_and_update().is_some() {
+            return;
+        }
     }
 }
 
@@ -445,8 +747,28 @@ pub async fn wait_for_stop(stop: &watch::Receiver<bool>) {
     }
 }
 
+/// Everything one pass over a layout needs.
+///
+/// A struct rather than a parameter list because the pass now has two jobs —
+/// fetch the bytes and watch for a segment that has fallen behind — and both
+/// need the same configuration.
+pub struct LayoutRun {
+    /// Shared transfer context.
+    pub context: TransferContext,
+    /// The intervals to fetch.
+    pub segments: Vec<SegmentState>,
+    /// The length the task believes the file has.
+    pub total_len: Option<u64>,
+    /// How many intervals may be in flight at once.
+    pub concurrency: usize,
+    /// Layout rules, for the §6.1 floor a split must respect.
+    pub policy: SegmentPolicy,
+    /// Splitting rules (§6.2).
+    pub split: SplitPolicy,
+}
+
 /// Run a whole segment layout to completion, with at most `concurrency`
-/// segments in flight.
+/// segments in flight, splitting a lagging segment when §6.2 says to.
 ///
 /// Returns once every segment has finished, the layout has to be re-planned, or
 /// the transfer was stopped. The caller decides what the task's next state is.
@@ -459,41 +781,224 @@ pub async fn wait_for_stop(stop: &watch::Receiver<bool>) {
 ///
 /// One rejected segment aborts the pass: the caller's remedy for a bad interval
 /// response is to re-probe and re-plan, not to keep hammering the same endpoint.
-pub async fn run_layout(
-    context: TransferContext,
-    segments: Vec<SegmentState>,
-    total_len: Option<u64>,
-    concurrency: usize,
-) -> LayoutOutcome {
+///
+/// # Splitting
+///
+/// The loop is a join loop with a check tick beside it. While any lane is
+/// running, the scheduler wakes every `split.check_interval` and asks
+/// [`plan_split`] whether some interval should be halved. A "yes" is applied to
+/// the progress board under the board's own lock — the same lock every chunk
+/// write takes to record what it wrote — and the bytes the old lane had not
+/// reached are handed to a new lane in this same pass. Nothing else in the pass
+/// is disturbed: lanes that are making progress are not paused, not
+/// re-requested and not re-planned.
+///
+/// Two rules keep the loop from spinning. Every failed attempt to apply a split
+/// waits `check_interval` for the next tick, and §6.2's cooldown is measured
+/// from the last split that actually happened rather than from the last one that
+/// was considered.
+pub async fn run_layout(run: LayoutRun) -> LayoutOutcome {
+    let LayoutRun {
+        context,
+        segments,
+        total_len,
+        concurrency,
+        policy,
+        split,
+    } = run;
     let plans = plans_for(&segments, total_len);
     // Nothing left to fetch. Returning here also covers the zero-length file,
     // whose layout has no segments at all.
     if plans.is_empty() {
-        return LayoutOutcome::Finished;
+        return LayoutOutcome::Finished {
+            segments: segments.clone(),
+        };
     }
 
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut lanes: JoinSet<SegmentOutcome> = JoinSet::new();
+    // Keyed by task id so an abort can name the one lane it wants to release.
+    // `abort_handle` is the only way to target a single lane: `JoinSet` offers
+    // `abort_all` and nothing finer, and aborting every lane would throw away
+    // the progress of the ones that are doing well.
+    //
+    // The sender lives here too, which also keeps the channel open: a lane
+    // parked on `changed()` treats a closed channel as a release, so a channel
+    // that closed early would wind lanes down for no reason.
+    type LaneOwner = (u32, watch::Sender<Option<SegmentDirective>>, tokio::task::AbortHandle);
+    let mut owners: std::collections::HashMap<tokio::task::Id, LaneOwner> =
+        std::collections::HashMap::new();
+
     for plan in plans {
-        let context = context.clone();
-        let permits = Arc::clone(&permits);
-        lanes.spawn(async move {
-            let id = plan.id;
-            let Ok(_permit) = permits.acquire_owned().await else {
+        let id = plan.id;
+        let (tx, rx) = watch::channel(None);
+        let context_for_lane = context.clone();
+        let permits_for_lane = Arc::clone(&permits);
+        let handle = lanes.spawn(async move {
+            let Ok(_permit) = permits_for_lane.acquire_owned().await else {
                 // Only `run_layout` closes the semaphore, and it cannot return
                 // while a lane is still running, so this is unreachable in
-                // practice; reporting it as a stop is the safe reading.
-                return SegmentOutcome::Stopped { id };
+                // practice; reporting a release is the safe reading.
+                return SegmentOutcome::WoundDown { id };
             };
-            fetch_segment(&context, plan).await
+            fetch_segment(&context_for_lane, plan, rx).await
         });
+        owners.insert(handle.id(), (id, tx, handle));
     }
+
+    // The lag tracker starts from what the board already holds, so a lane that
+    // is slow from the very first chunk is measured from the start of the pass
+    // rather than from the first time it moved.
+    let mut tracker = LagTracker::new();
+    let started = tokio::time::Instant::now();
+    for segment in &segments {
+        if segment.is_complete() {
+            continue;
+        }
+        tracker.register(segment.id, received_of(&context, segment.id), started);
+    }
+
+    let mut ticker = tokio::time::interval(split.check_interval.max(Duration::from_millis(10)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick of a `tokio` interval fires immediately, and a split at
+    // that instant would be a split with no evidence behind it.
+    ticker.tick().await;
 
     let mut rejection: Option<Failure> = None;
     let mut stopped = false;
-    while let Some(joined) = lanes.join_next().await {
+    let mut last_split: Option<tokio::time::Instant> = None;
+
+    loop {
+        let joined = tokio::select! {
+            maybe = lanes.join_next(), if !lanes.is_empty() => Some(maybe),
+            _ = ticker.tick(), if split.enabled && !lanes.is_empty() => None,
+        };
+        // The tick arm. Nothing in here may return early on a failed split: "no
+        // segment is eligible" and "the eligible one cannot be halved" are both
+        // ordinary answers, and the pass simply carries on.
+        let Some(joined) = joined else {
+            let now = tokio::time::Instant::now();
+            let within_cooldown = last_split
+                .is_some_and(|at| now.duration_since(at) < split.cooldown);
+            tracker.observe(&|id| Some(received_of(&context, id)), now);
+
+            let Some((layout, density)) = board_view(&context) else {
+                continue;
+            };
+            let stalled: Vec<u32> = layout
+                .iter()
+                .map(|segment| segment.id)
+                .filter(|id| tracker.has_stalled(*id, now, split.stall))
+                .collect();
+            // §6.2's "has fallen behind", made precise: the segment's own
+            // completion is below the task's mean completion by `lag_ratio`, and
+            // it owns at least `lag_share` of the bytes still outstanding. The
+            // second half of that test matters — a nearly finished segment that
+            // is behind in ratio terms has nothing left worth splitting.
+            let covered = total_len.unwrap_or(0);
+            let remaining_total: u64 = layout
+                .iter()
+                .map(|segment| segment.len().saturating_sub(density.durable_bytes(segment.id)))
+                .sum();
+            let mean_pace = if covered == 0 {
+                0.0
+            } else {
+                let done: u64 = layout
+                    .iter()
+                    .map(|segment| density.durable_bytes(segment.id))
+                    .sum();
+                (done as f64 / covered as f64).clamp(0.0, 1.0)
+            };
+            let behind: Vec<u32> = layout
+                .iter()
+                .filter(|segment| {
+                    let length = segment.len();
+                    if length == 0 {
+                        return false;
+                    }
+                    let pace = density.durable_bytes(segment.id) as f64 / length as f64;
+                    let remaining = length.saturating_sub(density.durable_bytes(segment.id));
+                    let share = if remaining_total == 0 {
+                        0.0
+                    } else {
+                        remaining as f64 / remaining_total as f64
+                    };
+                    mean_pace - pace >= split.lag_ratio && share >= split.lag_share
+                })
+                .map(|segment| segment.id)
+                .collect();
+
+            let Some(plan) = plan_split(
+                &layout,
+                &density,
+                &|id| behind.contains(&id),
+                &|id| stalled.contains(&id),
+                &split,
+                policy.min_segment_bytes,
+                policy.max_segments,
+                within_cooldown,
+            ) else {
+                continue;
+            };
+            let Some(applied) = apply_split(&context, &plan) else {
+                continue;
+            };
+            // §6.2's cooldown is measured from the last split that actually
+            // happened, so a refused one does not start the clock.
+            last_split = Some(now);
+            if let Err(error) = context.split_tx.try_send(applied.clone()) {
+                tracing::debug!(?error, "split report dropped");
+            }
+
+            // Take the interval away from the lane that had it, then give the
+            // bytes it had not reached to a new lane. The order is deliberate:
+            // the released lane winds down at its next chunk boundary and writes
+            // nothing past the interval the board is willing to account for, so
+            // there is no window in which two lanes may write the same byte.
+            let mut released = None;
+            for (task_id, (owner, tx, abort)) in &owners {
+                if *owner != plan.id {
+                    continue;
+                }
+                released = Some((*task_id, abort.clone()));
+                if tx.send(Some(SegmentDirective::Release)).is_err() {
+                    tracing::trace!("split lane had already finished");
+                }
+                break;
+            }
+            if let Some((task_id, abort)) = released {
+                abort.abort();
+                owners.remove(&task_id);
+            }
+
+            let fresh = SegmentPlan {
+                id: applied.back_id,
+                start: applied.back_start,
+                end: applied.back_end,
+                total_len,
+                done: 0,
+            };
+            let id = fresh.id;
+            let (tx, rx) = watch::channel(None);
+            let context_for_lane = context.clone();
+            let permits_for_lane = Arc::clone(&permits);
+            let handle = lanes.spawn(async move {
+                let Ok(_permit) = permits_for_lane.acquire_owned().await else {
+                    return SegmentOutcome::WoundDown { id };
+                };
+                fetch_segment(&context_for_lane, fresh, rx).await
+            });
+            owners.insert(handle.id(), (applied.back_id, tx, handle));
+            tracker.register(applied.back_id, applied.back_start, now);
+            continue;
+        };
+
+        let Some(joined) = joined else { break };
         match joined {
             Ok(SegmentOutcome::Done { .. }) => {}
+            // A lane that released its interval, or one whose permit was never
+            // handed out. Neither ends the pass.
+            Ok(SegmentOutcome::WoundDown { .. }) => {}
             Ok(SegmentOutcome::Stopped { .. }) => {
                 stopped = true;
                 lanes.abort_all();
@@ -517,18 +1022,96 @@ pub async fn run_layout(
     // Waiting for them here is what makes the pass's return value trustworthy.
     lanes.shutdown().await;
 
+    // The board is the authority on the layout once a split has happened, so the
+    // caller is handed the board's own view rather than the one it passed in.
+    let segments = match context.board.lock() {
+        Ok(board) => board.snapshot_segments(),
+        Err(_) => segments,
+    };
+
     match (rejection, stopped) {
         (Some(failure), _) => LayoutOutcome::Rejected { failure },
         (None, true) => LayoutOutcome::Stopped,
-        (None, false) => LayoutOutcome::Finished,
+        (None, false) => LayoutOutcome::Finished { segments },
+    }
+}
+
+/// Apply a split to the board, flushing first if a byte an earlier lane wrote
+/// has not been confirmed yet.
+///
+/// The flush is conditional because the ordinary case has nothing pending, and
+/// forcing a file flush on every check tick would be a real cost for no gain.
+/// When something *is* pending it has to be confirmed first: the split point is
+/// the durable frontier, and a frontier that is behind a written byte would
+/// leave that byte claimed by neither half.
+fn apply_split(context: &TransferContext, plan: &SplitPlan) -> Option<SplitOutcome> {
+    let needs_flush = match context.board.lock() {
+        Ok(board) => board.pending_before(plan.id) || board.pending_for(plan.id) > 0,
+        Err(_) => return None,
+    };
+    if needs_flush {
+        crate::engine::job::flush_once(&context.board, &context.file);
+    }
+    let mut board = context.board.lock().ok()?;
+    board.replace_split(plan)
+}
+
+/// The board's layout together with its density, borrowed for one decision.
+///
+/// The board lock is held for the whole of a check tick. That is deliberate: the
+/// decision and the mutation it leads to must see the same board, or a lane
+/// could complete a segment in between and the split would be applied to a state
+/// the plan was not computed from.
+fn board_view(context: &TransferContext) -> Option<(Vec<SegmentState>, BoardDensity)> {
+    let board = context.board.lock().ok()?;
+    let layout = board.snapshot_segments();
+    let density = BoardDensity {
+        durable: layout
+            .iter()
+            .map(|segment| (segment.id, segment.durable_len()))
+            .collect(),
+    };
+    Some((layout, density))
+}
+
+/// How much of each segment is confirmed durable, in the form [`plan_split`]
+/// wants.
+///
+/// The split point is the *durable* frontier, so this is the durable count and
+/// not the on-disk one: the two differ by whatever has been written since the
+/// last flush, and handing the first half a byte the store has not confirmed
+/// would make it complete over a hole.
+struct BoardDensity {
+    durable: Vec<(u32, u64)>,
+}
+
+impl crate::engine::split::SplitDensity for BoardDensity {
+    fn durable_bytes(&self, id: u32) -> u64 {
+        self.durable
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map_or(0, |(_, bytes)| *bytes)
+    }
+}
+
+/// Bytes of one interval that are on disk: durable plus pending.
+fn received_of(context: &TransferContext, id: u32) -> u64 {
+    match context.board.lock() {
+        Ok(board) => board.on_disk_for(id).unwrap_or(0),
+        Err(_) => 0,
     }
 }
 
 /// How a pass over the whole layout ended.
 #[derive(Debug)]
 pub enum LayoutOutcome {
-    /// Every segment reported completion.
-    Finished,
+    /// Every segment reported completion. `segments` is the board's own final
+    /// layout, which differs from the one the pass started with whenever §6.2
+    /// split something.
+    Finished {
+        /// The layout as the board ended up holding it.
+        segments: Vec<SegmentState>,
+    },
     /// A response disagreed with its request. Nothing extra was written.
     Rejected {
         /// Structured reason, for the caller to classify.
@@ -540,8 +1123,7 @@ pub enum LayoutOutcome {
 
 /// Build the plan list for a layout, given the current durable positions and
 /// the length the task believes the file has.
-pub fn plans_for(segments: &[SegmentState], total_len: Option<u64>) -> Vec<SegmentPlan> {
-    segments
+pub fn plans_for(segments: &[SegmentState], total_len: Option<u64>) -> Vec<SegmentPlan> {    segments
         .iter()
         .filter(|segment| !segment.is_complete())
         .map(|segment| SegmentPlan {

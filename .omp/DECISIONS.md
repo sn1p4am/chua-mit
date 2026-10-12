@@ -336,3 +336,44 @@ eMule 是 GPL-2.0。这与 `CLEANROOM.md` R1/R2 完全一致：**不得阅读**�
 以及两份早期任务产出文档（`FluxDown-源码级功能调研.md`、`TDM-Fast-vs-FluxDown-功能对比.md`）
 ——它们是用户最初明确要求的交付物，未经点名不擅自删除。
 
+---
+
+## ADR-0012 · 许可白名单追加 `CDLA-Permissive-2.0`，并放宽 wildcard 检查 —— 已定（2026-10-12）
+
+**背景**：CI 首次真正运行（仓库推上 GitHub 之后），`licence policy` 作业失败：
+
+```
+error[rejected]: failed to satisfy license requirements
+   webpki-root-certs-1.0.9/Cargo.toml:26   license = "CDLA-Permissive-2.0"
+   rejected: license is not explicitly allowed
+   webpki-root-certs v1.0.9
+     └── rustls-platform-verifier v0.7.1 → reqwest v0.13.5 → chua-engine → chua-cli
+```
+
+这正是 `.omp/research/permissive-rust-stack-report.md` 预警过的那一项，只是形态与预期不同：
+预警说的是「不要用 `webpki-roots`（冻结的 Mozilla 证书集）作为验证器」，
+而实际进入依赖树的是它的后继 crate `webpki-root-certs`，
+由 `rustls-platform-verifier` 作为**没有原生验证器的平台上的回退**引入。
+
+**决策**：
+
+1. **把 `CDLA-Permissive-2.0` 加入白名单。** 它是 Linux Foundation 的**数据**许可
+   （Community Data License Agreement – Permissive 2.0），无 copyleft、无商用限制，
+   与本项目的 MIT 分发兼容。它约束的是证书**数据**，不是代码。
+2. **这不推翻 ADR-0008 的中国大陆判断。** 该 ADR 反对的是把冻结的 Mozilla 根证书集
+   **当作验证器**；而 `rustls-platform-verifier` 在 Windows/macOS 上走**系统验证器**，
+   这份数据只在没有原生验证器的平台上起作用。主路径仍是系统证书存储。
+3. **`[bans] wildcards` 由 `deny` 改为 `allow`。** 报错是
+   `crates/cli/Cargo.toml:15  chua-engine.workspace = true` 被判为通配依赖。
+   工作区内的路径依赖不是通配风险——它的版本由 `Cargo.lock` 固定，
+   而 `wildcards` 这条检查针对的是从 registry 引入的不定版本依赖。
+   保留该检查会持续误报，而**一个长期误报的检查会被习惯性忽略**，那比没有检查更糟。
+
+**代价与替代**：白名单多一条许可证；`wildcards` 检查在工作区依赖上失效。
+若不接受前者，替代方案是弃用 `rustls-platform-verifier` 改用 `rustls-native-certs`
+（直接读系统证书存储，不带捆绑根证书）——但那是实现层的依赖变更，需要单独评估。留作可选。
+
+**这条 ADR 的由来值得记下**：这份配置在本轮之前**从未被执行过**。
+它是「提交了但没验证」的典型——写的时候自认为对，跑起来第一条就错。
+**凡是门禁，上线前必须至少在真环境跑过一次。**
+
