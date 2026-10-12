@@ -168,29 +168,31 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
 | §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
 
-### 当前阻塞（**交付物尚不可用**）—— 快照 @ 第 58 轮
+### 当前阻塞（**交付物尚不可用**）—— 快照 @ 第 59 轮
 
 **已解决的**：`Actor: Sync`（改用 `Mutex<Store>`）、`watch` 通道传反、
-`ranges.rs:60` 整数溢出（哨兵值显式处理）、`Content-Disposition` 取末段规则。
-**两个原始挂死已消除**，测试从「无限挂起」变为可跑完。
+`ranges.rs:60` 整数溢出（哨兵值显式处理）、`Content-Disposition` 取末段规则、
+两个原始挂死。
 
-**仍未通过**：
+**进行中**：`throttle.rs` 的 `claim()` 正在按「单次强 CAS 推进时间线」重构
+（该函数已三次出问题，故不再打补丁）。重构进行中，**当前 crate 编译不过**：
+`error[E0599]: no method named queue_for found for struct throttle::TokenBucket`（6 处）——
+调用方仍在使用被移除/改名的方法。
 
-1. **第三个挂死，仍在 throttle**：单线程跑时最后一行是
-   `concurrent_reservations_do_not_double_spend`。
-   该函数已是**第三次**出问题（先失败 → 挂死 → 再失败 → 又挂死）。
-   建议停止打补丁，改为「单次强 CAS 推进时间线」结构：重试天然有进展，
-   "重复领取"在结构上不可能发生。详见发给实现会话的消息。
-2. **4 个失败用例**：`throttle::a_faster_rate_shortens_the_wait`（left 4100 / right 0）、
-   `events::eta_refuses_to_guess_from_a_weak_signal`、
-   `filename::mixed_encoding_names`（v1.0.2 的解码顺序）、
+> ⚠️ **验证陷阱**：重构期间 `cargo test --no-run` 会失败，磁盘上的测试二进制因此是**陈旧的**。
+> 此时跑测试得到的任何结论都与当前代码无关。**必须先用 `--no-run` 确认构建成功，再跑测试。**
+
+**待办（按优先级）**：
+1. crate 能编译
+2. 无测试空转
+3. 4 个失败用例：`throttle::a_faster_rate_shortens_the_wait`、
+   `events::eta_refuses_to_guess_from_a_weak_signal`、`filename::mixed_encoding_names`（v1.0.2 解码顺序）、
    `job::prepare_target_truncates_to_the_confirmed_count`
-3. **`cargo clippy` 有 2 个 error + 14 个 warning**，两条 error 都是 `AGENTS.md` §5 明文禁止的写法：
-   - `throttle.rs:229` —— `ignoring a result with .ok() is misleading`
-   - `engine/mod.rs:203` —— `let _ = wait.await;`（non-binding let on `#[must_use]`）
-4. **`cargo fmt --all --check` 不干净**：`config.rs:291`、`engine/job.rs:101/218/655/686` 等
-5. **`crates/cli` 尚未创建** —— 验收套件需要它才能跑（接口见 `spec/cli-v1.md`）
-6. `engine/mod.rs` 974 行、`engine/job.rs` 约 1000 行，超出 `AGENTS.md` §5 的 600 行指引
+4. `cargo clippy --workspace --all-targets -- -D warnings` —— 2 个 error 均为 `AGENTS.md` §5 禁止的写法
+   （`throttle.rs:229` 的 `.ok()`、`engine/mod.rs:203` 的 `let _ = wait.await;`）+ 14 warning
+5. `cargo fmt --all` —— `config.rs:291`、`engine/job.rs:101/218/655/686` 等
+6. `crates/cli`（接口见 `spec/cli-v1.md`）—— 验收套件的最后一道门
+7. 拆分 `engine/mod.rs`（974 行）、`engine/job.rs`（约 1000 行），`AGENTS.md` §5 指引为 600 行
 
 ### 验收工具已就绪
 
