@@ -166,4 +166,25 @@ grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/
 | 日期 | 会话标识 | 侧 | 读过上游源码 | 输入 | 产出 |
 |---|---|---|---|---|---|
 | 2026-10-12 | `implement-m1-engine-slice`（子代理） | **干净侧** | **否** —— 只读了 `spec/engine-v1.md`、`spec/cli-v1.md`、`CLEANROOM.md`、`AGENTS.md`、`.omp/` 下的文档，以及公开的 crate 源码（`reqwest` 的本地 registry 副本）；任务书明确禁止读写 `chua/`、`app/`、`tamper-test/`、`.chua-verify` | M1 slice 1 任务书 | `Cargo.toml`、`rustfmt.toml`、`crates/engine/**`（16 个源文件，lib 129 测试通过 / 5 忽略） |
+| 2026-10-12 | `implement-m1-integration-and-cli`（子代理） | **干净侧** | **否** —— 输入为 `spec/engine-v1.md`（v1.0.3）、`spec/cli-v1.md`、`CLEANROOM.md`、`AGENTS.md`、`.omp/PITFALLS.md`、`.omp/PROGRESS.md` 与既有 `crates/` 源码；任务书明确禁止阅读任何 copyleft 下载器的源码，也不得为了照抄而上网搜索同类实现 | M1 收口任务书（集成测试 + 限速修复 + CLI） | `crates/engine/tests/{common/mod.rs,http_end_to_end.rs}`、`crates/cli/**`（5 个源文件）、`engine/{job,transfer,throttle,mod,ranges}.rs` 的修复 |
+
+### 8.3 追加：`crates/cli/**` 与集成测试的逐文件来源
+
+**依据的规格版本**：`engine-v1.md` **v1.0.3**（§9.1 配速不变式）、**v1.0.4**（§6.3 结果导向）、
+`cli-v1.md` **v1.0.0**。上述澄清均在实现过程中发布并被采纳。
+
+| 文件 | 实现会话 | 依据规格 | 接触过上游源码 |
+|---|---|---|---|
+| `crates/engine/tests/common/mod.rs` | `implement-m1-integration-and-cli` | §6、§7、§10（真实 socket 的测试基建） | **否** |
+| `crates/engine/tests/http_end_to_end.rs` | 同上 | §4.3、§6.3、§7.3(2)、§9.1、§9.3 | **否** |
+| `crates/cli/Cargo.toml` | 同上 | ADR-0005、ADR-0008 | **否** |
+| `crates/cli/src/main.rs` | 同上 | `cli-v1.md` §2、§3 | **否** |
+| `crates/cli/src/cli.rs` | 同上 | `cli-v1.md` §2（命令与参数） | **否** |
+| `crates/cli/src/host.rs` | 同上 | `cli-v1.md` §5（`CHUA_DATA_DIR`）、ADR-0004 | **否** |
+| `crates/cli/src/error.rs` | 同上 | `cli-v1.md` §3（退出码） | **否** |
+| `crates/cli/src/render.rs` | 同上 | `cli-v1.md` §4（纯 ASCII、非 TTY 无控制字符） | **否** |
+
+**说明**：本表由实现会话追加，规格侧只做了版本与路径的事实核对，未改动内容——
+表格的填写权属实现侧，规格侧代填会让这份记录失去作为来源证据的意义。
+（§8.1 的说明依然成立；此处两条会话日志与其产出表由对应会话自行登记。）
 
