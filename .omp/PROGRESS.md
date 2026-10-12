@@ -48,12 +48,25 @@
 - [x] **`spec/engine-v1.md` 完成并通过 §5 自查**
   - 证据：见下方「规格自查记录」
 - [x] **`spec/ui-v1.md` 完成（框架无关部分）并通过 §5 自查**
-  - 证据：见下方「规格自查记录」。§9 待 ADR-0003 定稿后补充
+  - 证据：见下方「规格自查记录」。§9 待 ADR-0003 完全定稿后补充
+- [x] **UI 框架调研 —— ADR-0003 有条件选定 GPUI / `gpui-fast`**
+  - 证据（全部读自本地 checkout `gpui-fast-3d7669d275fca649`，许可 Apache-2.0，Zed Industries + Longbridge）：
+    - Windows 后端 = **DirectX 11**，特性级下限 **10.1**（`crates/gpui_windows/src/directx_devices.rs`），
+      且 `directx_atlas.rs` 有 WARP 软件回退、`handle_device_lost` 有设备丢失恢复
+    - 中文文本走 **DirectWrite**（`direct_write.rs` 的 `DirectWriteTextSystem` 实现 `PlatformTextSystem`）
+    - **中文输入法完整实现**：`events.rs` 处理 `WM_IME_COMPOSITION`、调用 `ImmGetCompositionStringW`、
+      把候选窗定位到光标、按窗口开关并显式防串窗
+    - 列表按 **GPU tile** 缓存，只重绘变化的 tile（`fast/layers/lists.rs`）
+    - **帧循环是脏标记驱动**：`app.rs:1903/1914` 只在 `window.invalidator.is_dirty()` 或有
+      next-frame 回调时才绘制——这是「空闲 CPU < 0.1%」能否成立的关键
+    - 上游同步有脚本与文档（`UPSTREAM` 固定 zed commit + `script/check-upstream` + `docs/upstream-sync.md`）
+  - 风险与备选顺序见 `.omp/DECISIONS.md` ADR-0003
 
 ## M0 进行中
 
-- [~] **UI 框架选型（ADR-0003）**——GPUI / `gpui-fast` 调研进行中
 - [~] 宽松 crate 栈逐协议普查（可行性与缺口清单）
+- [ ] **ADR-0003 的验证门槛**：在**本仓库之外**的临时目录做 GPUI spike，实测 5 项
+      （冷启动 / 5 万行滚动 / 空闲占用 / 中文输入法与字体 / 构建与体积）。任一不达标即转 iced
 - [ ] 最小 CI（`fmt` + `check`）
 - [ ] 创建 GitHub 远端并推送
 
@@ -107,7 +120,8 @@ ADR-0003（UI 选型）是唯一未决项，但不阻塞 `spec/engine-v1.md`，�
 |---|---|
 | `6882fda` | M0：建立 MIT 仓库骨架、干净室流程、决策记录、产品方案与里程碑 |
 | `ee6d28d` | M0：`spec/engine-v1.md` 引擎行为规格 v1.0.0 |
-| _（待提交）_ | M0：`spec/ui-v1.md` 界面规格 v1.0.0 |
+| `0a9f343` | M0：`spec/ui-v1.md` 界面规格 v1.0.0 |
+| _（待提交）_ | M0：ADR-0003 有条件选定 GPUI / `gpui-fast` |
 
 ---
 

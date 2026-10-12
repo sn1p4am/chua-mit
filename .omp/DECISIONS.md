@@ -43,21 +43,63 @@
 
 ---
 
-## ADR-0003 · UI 框架选型 —— 待定（调研中）
+## ADR-0003 · UI 框架：Zed GPUI（经 `gpui-fast`）—— 有条件选定，**以落地实测为门槛**（2026-10-12）
 
-**候选**：Zed GPUI / `gpui-fast`（Apache-2.0）、egui、iced、floem、slint、Tauri、原生 Win32/WinUI。
+**结论**：主选 **GPUI / `gpui-fast`**，但**必须先通过下方「验证门槛」的实测**；未通过则退备选。
+本条取代此前的「待定（调研中）」占位。
 
-**硬需求**：
+**硬需求**（评审基准，未变）：简约极致的桌面界面；四项速度指标（冷启动 / 空闲占用 / 大列表滚动 /
+实时进度刷新）；**中文字体回退与输入法必须可靠**；Windows 优先；宽松许可且 1–2 年内不返工。
 
-1. 简约极致——小而成体系的桌面界面（任务列表、进度、速度图、设置、托盘），不需要代码编辑器级文本栈。
-2. 四项速度指标：冷启动、空闲占用、大列表滚动、实时进度刷新，均有数值预算（见 `PLAN.md`）。
-3. **中文字体回退与中文输入法必须可靠**——这是目标市场的硬门槛。
-4. Windows 优先（目标用户绝大多数在 Windows）。
-5. 宽松许可、长期可维护、可锁定版本，1–2 年产品周期内不因上游破坏性变更而返工。
+**证据**（本地 checkout `gpui-fast-3d7669d275fca649`，许可 Apache-2.0，版权 Zed Industries + Longbridge）：
 
-**证据线索**（待 `调研/UI 框架` 结论落地）：`gpui-fast` 是 Zed GPUI 的性能分支，宣称
-Retained Mode 只重建变化的部分，Linux release 构建下空窗 CPU 时间 3.31ms → 0.19ms、
-列表滚动 5.95ms → 0.79ms。这些数字直接对应需求 2，但需核实 Windows 后端、CJK、稳定性与生态。
+| 需求 | 证据 | 结论 |
+|---|---|---|
+| Windows 图形后端 | `crates/gpui_windows/src/directx_devices.rs`：`D3D11CreateDevice`，特性级 `11_1 / 11_0 / **10_1**`；`directx_renderer.rs`：DXGI 合成交换链 + HLSL | ✅ 特性级 10.1 ≈ 2009 年后的显卡即可，覆盖国内老设备 |
+| 无 GPU / 远程桌面 | `directx_atlas.rs` 测试路径使用 `D3D_DRIVER_TYPE_WARP`（软件光栅化）；`handle_device_lost` 有设备丢失恢复 | ✅ 有回退路径，不会直接崩 |
+| 备用渲染后端 | 独立 crate `gpui_wgpu`（wgsl 着色器，含 `shaders_webgl.wgsl`） | ✅ 需要时可切到 wgpu（DX12 / Vulkan / GL） |
+| 中文文本 | `direct_write.rs`：`DirectWriteTextSystem` 实现 `PlatformTextSystem`，用系统 DirectWrite 做字体选择、字形索引/步进/偏移/簇映射与光栅化 | ✅ 直接吃 Windows 原生 CJK 字体回退 |
+| **中文输入法** | `events.rs`：处理 `WM_IME_STARTCOMPOSITION` / `WM_IME_COMPOSITION`，调用 `ImmGetContext`、`ImmGetCompositionStringW`（`GCS_RESULTSTR` / `GCS_COMPSTR` / `GCS_CURSORPOS` / `GCS_COMPATTR`）；`handle_ime_position` 把候选窗定位到光标；`update_ime_enabled` 按窗口开关，并显式防串窗（注释指出 IME context 是线程级的） | ✅ **生产级实现，不是占位** |
+| 大列表滚动 | `fast/layers/lists.rs`：列表按 **GPU tile** 缓存，用 `tile_hashes` / `dirty_tiles` 只重绘变化的 tile | ✅ 正对「5 万行滚动」 |
+| 高频增量刷新 | README 基准（Linux release，每帧 CPU）：「流式行情刷新」5.06ms → **1.35ms**；「列表滚动」5.95ms → **0.79ms**；「窗口无变化」3.31ms → **0.19ms** | ✅ 该场景就是下载器的实时进度列表 |
+| **空闲不烧帧** | `app.rs:1903/1914` 只在 `window.invalidator.is_dirty()` 或存在 next-frame 回调时才绘制；`vsync.rs` 的 vsync 线程有明确 idle 概念；`profiler.rs` 有 `animating_at_last_present = next_frame_scheduled && window_active` | ✅ **脏标记驱动**，不是无脑每帧重绘——这是「空闲 CPU < 0.1%」能否成立的关键 |
+| 上游可跟进 | `UPSTREAM` 固定 zed commit + `script/check-upstream` + `docs/upstream-sync.md` | ✅ 有脚本化同步流程，不是死分支 |
+
+**风险**（必须正视，不能只看上表）：
+
+1. **成熟度**：README 自述 *"The project remains experimental"*；crates.io 上是 0.1.0；
+   checkout 内 `crates/gpui` 版本 0.2.2 且 `publish = false`。用法是改名引用
+   （`gpui = { package = "gpui-fast" }`）外加 `[patch.crates-io]`，构建系统有额外复杂度。
+2. **两层上游**：Zed → gpui-fast → 我们。任一层破坏性变更都要跟。
+3. **不自带控件库**：GPUI 只给原语。按钮 / 输入框 / 对话框 / 表格要另找
+   `gpui-component` / `gpui-kit`（Longbridge，0.7.1）——那是第三个依赖，其许可与成熟度
+   要一并确认。
+4. **保留模式会在特定情况下关闭**：`docs/retained-mode.md` 明确列出窗口刷新（缩放 / 焦点变化）、
+   拖拽中、inspector 取色、无障碍激活时**不复用**上一帧。前两项对本产品可接受
+   （拖拽只用于排队任务的排序）。
+5. **无障碍与保留模式互斥**：M5 不含无障碍，但需要后续方案。
+
+**验证门槛（ADR 完全定稿的前置）**：做一个一次性 spike，**放在本仓库之外的临时目录**
+（不产生入库产物，因此不触发 `CLEANROOM.md` 的规格侧/实现侧限制），只回答五个问题：
+
+1. 冷启动到首帧实测（目标 < 300 ms）——这是「极速」里最难的一项。
+2. 5 万行虚拟化列表 + 20 行 10 Hz 更新：滚动最长帧时间、单帧 CPU 时间。
+3. 窗口打开且无任务时的**空闲 CPU 与内存**（对应 < 0.1% 与 < 80 MB）——
+   验证上表最后一行「脏标记驱动」在真实应用里确实生效。
+4. 中文：字体回退是否缺字 / 豆腐块；微软拼音或搜狗在输入框内的**候选窗定位**是否正确。
+5. 二进制体积，以及在一台干净 Windows 上 `cargo build` 能否跑通（含 `[patch.crates-io]`）。
+
+**任一项不达标即转备选。备选顺序**：
+
+1. **iced**——wgpu + cosmic-text，保留式（Elm 架构），MIT，中文字体走 cosmic-text。
+2. **egui**——生态最大、上手最快、MIT/Apache，但**即时模式正是「大列表 + 高频刷新」最吃力的形态**，
+   需要自己做缓存规避。
+3. **Win32 / WinUI 原生**——速度上限最高，但开发成本与中文输入法细节要自己扛。
+
+**为什么值得冒成熟度的风险**：本产品对 UI 的核心诉求是「大列表 + 高频增量刷新 + 常驻低占用」，
+而 `gpui-fast` 存在的唯一理由就是把这三件事做快，并且有可复核的实测数字、有脚本化的上游同步流程、
+许可是宽松的 Apache-2.0。换成即时模式框架，这三件事都会变成持续的对抗。
+
 
 ---
 
