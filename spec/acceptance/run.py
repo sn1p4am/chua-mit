@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import os
 import shutil
 import subprocess
@@ -31,6 +32,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "range_server.py"
 PAYLOAD_SIZE = 8 * 1024 * 1024  # 8 MiB: big enough to force several segments
+
+_DIR_COUNTER = itertools.count()
 
 
 class Result:
@@ -85,11 +88,25 @@ def expected_sha(port: int) -> str:
         return response.read().decode()
 
 
-def run_cli(cli: Path, args: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
+def run_cli(
+    cli: Path, args: list[str], cwd: Path, timeout: float, data_dir: Path | None = None
+) -> tuple[int, str]:
+    """Run the CLI with an isolated state directory (spec/cli-v1.md §5).
+
+    Every call gets its own `CHUA_DATA_DIR` unless one is passed in, so scenarios
+    cannot leak tasks into each other. The resume check passes the same directory
+    to both halves on purpose.
+    """
+    if data_dir is None:
+        data_dir = cwd / f"state-{next(_DIR_COUNTER)}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["CHUA_DATA_DIR"] = str(data_dir)
     try:
         completed = subprocess.run(
             [str(cli), *args],
             cwd=cwd,
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -206,9 +223,14 @@ def main() -> int:
         # ---- 6. resume after an abrupt kill -------------------------------
         set_mode(args.port, "normal")
         dest = work / "resume.bin"
+        resume_state = work / "state-resume"
+        resume_state.mkdir(parents=True, exist_ok=True)
+        resume_env = dict(os.environ)
+        resume_env["CHUA_DATA_DIR"] = str(resume_state)
         proc = subprocess.Popen(
             [str(cli), "add", url, str(dest)],
             cwd=work,
+            env=resume_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -225,15 +247,28 @@ def main() -> int:
         proc.kill()
         proc.wait(timeout=10)
 
-        code, out = run_cli(cli, ["resume", "--all"], work, timeout=120)
+        code, out = run_cli(
+            cli, ["resume", "--all"], work, timeout=120, data_dir=resume_state
+        )
         if code != 0:
-            # Fall back to re-adding the same URL, which should also resume.
-            code, out = run_cli(cli, ["add", url, str(dest)], work, timeout=120)
+            # Re-adding the same URL to the same state directory should also
+            # resume rather than start over.
+            code, out = run_cli(
+                cli, ["add", url, str(dest)], work, timeout=120, data_dir=resume_state
+            )
         settle(dest, timeout=90)
         if dest.exists() and sha256_file(dest) == good:
-            result.add("resume-after-kill", True, f"resumed from ~{partial} bytes, final sha256 matches")
+            result.add(
+                "resume-after-kill",
+                True,
+                f"resumed from ~{partial} bytes, final sha256 matches",
+            )
         else:
-            result.add("resume-after-kill", False, f"partial={partial} exit={code}\n{out[-400:]}")
+            result.add(
+                "resume-after-kill",
+                False,
+                f"partial={partial} exit={code}\n{out[-400:]}",
+            )
 
     finally:
         server.terminate()
