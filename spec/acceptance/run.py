@@ -89,13 +89,20 @@ def expected_sha(port: int) -> str:
 
 
 def run_cli(
-    cli: Path, args: list[str], cwd: Path, timeout: float, data_dir: Path | None = None
+    cli: list[str], args: list[str], cwd: Path, timeout: float, data_dir: Path | None = None
 ) -> tuple[int, str]:
     """Run the CLI with an isolated state directory (spec/cli-v1.md §5).
+
+    `cli` is a command *plus* its arguments, so the suite can be pointed at a
+    wrapper, a script, or `cargo run --` as easily as at a bare executable.
 
     Every call gets its own `CHUA_DATA_DIR` unless one is passed in, so scenarios
     cannot leak tasks into each other. The resume check passes the same directory
     to both halves on purpose.
+
+    A failure to even launch the command is reported as a failed check rather
+    than raised: a harness that dies with a traceback tells you nothing, and the
+    most likely reason to be here is that the binary has not been built yet.
     """
     if data_dir is None:
         data_dir = cwd / f"state-{next(_DIR_COUNTER)}"
@@ -104,7 +111,7 @@ def run_cli(
     env["CHUA_DATA_DIR"] = str(data_dir)
     try:
         completed = subprocess.run(
-            [str(cli), *args],
+            [*cli, *args],
             cwd=cwd,
             env=env,
             capture_output=True,
@@ -117,6 +124,8 @@ def run_cli(
         if isinstance(out, bytes):
             out = out.decode(errors="replace")
         return 124, out + "\n<timed out>"
+    except OSError as error:
+        return 127, f"could not launch {cli!r}: {error}"
 
 
 def settle(path: Path, timeout: float = 30.0) -> bool:
@@ -139,13 +148,29 @@ def settle(path: Path, timeout: float = 30.0) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cli", required=True, help="path to the CLI binary")
+    parser.add_argument(
+        "--cli",
+        required=True,
+        nargs="+",
+        help="the CLI command, e.g. --cli path/to/chua-cli.exe "
+        "or --cli python fake_cli.py",
+    )
     parser.add_argument("--port", type=int, default=8731)
     args = parser.parse_args()
 
-    cli = Path(args.cli).resolve()
-    if not cli.exists():
-        print(f"CLI not found: {cli}", file=sys.stderr)
+    cli: list[str] = list(args.cli)
+    # The CLI is run with `cwd` set to a scratch directory, so any argument that
+    # names a file has to be made absolute here or it will not resolve. Resolve
+    # every token, not just the first: `--cli python fake_cli.py` puts the script
+    # second.
+    for index, token in enumerate(cli):
+        candidate = Path(token)
+        if candidate.is_file():
+            cli[index] = str(candidate.resolve())
+    # `shutil.which` covers both cases: a bare name found on PATH (`python`,
+    # `cargo`) and an absolute path to something that exists.
+    if shutil.which(cli[0]) is None:
+        print(f"CLI not found: {cli[0]}", file=sys.stderr)
         return 2
 
     result = Result()
@@ -176,18 +201,34 @@ def main() -> int:
         # ---- 2. the dangerous one: server ignores Range -------------------
         #    A server that answers a ranged request with 200 + the whole body
         #    must never lead to a file that is reported complete but wrong.
+        #
+        #    The verdict hinges on the EXIT CODE, because that is how a downloader
+        #    reports its result. Exiting non-zero is a loud failure and is always
+        #    acceptable, whatever is left on disk — a downloader that preallocates
+        #    necessarily leaves a full-size file behind, and calling that
+        #    "misleading" would fail every correct implementation. The bug we are
+        #    hunting is specifically: **claimed success, bytes wrong.**
         set_mode(args.port, "ignore-range")
         dest = work / "ignored.bin"
         code, out = run_cli(cli, ["add", url, str(dest)], work, timeout=90)
         settle(dest, timeout=15)
-        if not dest.exists():
-            result.add("range-ignored", True, f"no file written; exit={code}")
-        elif dest.stat().st_size == PAYLOAD_SIZE and sha256_file(dest) == good:
-            result.add("range-ignored", True, "downloaded correctly anyway")
-        elif dest.stat().st_size == PAYLOAD_SIZE:
-            result.add("range-ignored", False, "SILENT CORRUPTION: full-size file with wrong bytes")
+        size = dest.stat().st_size if dest.exists() else 0
+        if code == 0:
+            perfect = dest.exists() and size == PAYLOAD_SIZE and sha256_file(dest) == good
+            result.add(
+                "range-ignored",
+                perfect,
+                "claimed success and the bytes are right"
+                if perfect
+                else f"CLAIMED SUCCESS (exit 0) with a wrong result: size={size}, "
+                f"expected {PAYLOAD_SIZE}",
+            )
         else:
-            result.add("range-ignored", True, f"partial file {dest.stat().st_size} bytes, not claimed complete; exit={code}")
+            result.add(
+                "range-ignored",
+                True,
+                f"failed loudly (exit {code}); file on disk: {size} bytes (not claimed complete)",
+            )
 
         # ---- 3. unknown length (no Content-Length) ------------------------
         set_mode(args.port, "no-length")
@@ -228,7 +269,7 @@ def main() -> int:
         resume_env = dict(os.environ)
         resume_env["CHUA_DATA_DIR"] = str(resume_state)
         proc = subprocess.Popen(
-            [str(cli), "add", url, str(dest)],
+            [*cli, "add", url, str(dest)],
             cwd=work,
             env=resume_env,
             stdout=subprocess.DEVNULL,
