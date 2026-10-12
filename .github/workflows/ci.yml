@@ -81,6 +81,17 @@ jobs:
             fail=1
           fi
 
+          # Project names are the easy half. The harder leak is an *internal
+          # type name* from the upstream source, which no project-name search
+          # will find — it reads like ordinary code. These are known upstream
+          # trait names; the list is short because naming a type is exactly what
+          # the clean-room rule forbids, so the correct move when one appears is
+          # to rename it, not to extend this list.
+          if grep -rnE '\b(EventSink|HostSelection|ApiHost)\b' crates/ spec/ 2>/dev/null; then
+            echo "::error::an upstream-internal type name appears in code or spec"
+            fail=1
+          fi
+
           if grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/ 2>/dev/null; then
             echo "::error::a path into the copyleft tree leaked into code or spec"
             fail=1
