@@ -119,8 +119,26 @@ grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/
 
 ## 8. 逐文件来源表
 
-随实现推进填充。实现侧每新增一个源文件追加一行。
+**M1 实现会话标识**：`implement-m1-engine-slice`（独立子代理，输入仅为 `spec/`、`AGENTS.md`、
+`CLEANROOM.md`、`.omp/DECISIONS.md`、`.omp/PLAN.md`、`.omp/ROADMAP.md`、`.omp/PITFALLS.md`；
+任务书中明确禁止读写任何 copyleft 目录）。**依据的规格版本：`engine-v1.md` v1.0.0。**
 
-| 文件 | 实现会话 | 依据的规格版本 | 实现会话是否接触过上游源码 |
+| 文件 | 实现会话 | 依据规格 | 接触过上游源码 |
 |---|---|---|---|
-| _（待填充）_ | | | |
+| `Cargo.toml`（workspace）、`rustfmt.toml` | 同上 | — | **否** |
+| `crates/engine/Cargo.toml` | 同上 | ADR-0005、ADR-0008 | **否** |
+| `crates/engine/src/lib.rs` | 同上 | §1、§10、ADR-0004 | **否** |
+| `crates/engine/src/state.rs` | 同上 | §3（9 状态与合法迁移表） | **否** |
+| `crates/engine/src/failure.rs` | 同上 | §8.2（12 类）、§8.3（退避） | **否** |
+| `crates/engine/src/http.rs` | 同上 | §4（探测）、§6.3（区间校验）、§8 | **否** |
+| `crates/engine/src/filename.rs` | 同上 | §4.2（推导与净化） | **否** |
+| `crates/engine/src/config.rs` | 同上 | §6.1、§11 | **否** |
+| `crates/engine/src/model.rs` | 同上 | §2（不变式 I1）、§7.3（durable 语义） | **否** |
+| `crates/engine/src/events.rs` | 同上 | §9.4、§10、ADR-0004 | **否** |
+| `crates/engine/src/util/{mod,percent}.rs` | 同上 | §4.2 | **否** |
+
+**尚未落地**（`lib.rs` 已声明但文件未创建）：`store.rs`（§7）、下载主循环与引擎句柄（§6、§9、§10）、
+`crates/cli/**`。这些文件创建后由**实现会话自行追加**到本表。
+
+**说明**：本表只列真实存在的文件。M1 交付时由规格侧逐项复核（复核清单见 `.omp/TODO.md`），
+但**表格的填写权属实现侧**——规格侧代填会让这份记录失去作为来源证据的意义。
