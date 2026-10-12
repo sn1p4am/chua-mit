@@ -18,6 +18,12 @@ dist/
 *.dll
 *.app
 
+# Python (acceptance harness and repo scripts)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
 # Local scratch (never committed)
 /tmp/
 /scratch/

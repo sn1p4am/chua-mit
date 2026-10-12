@@ -1,0 +1,27 @@
+[package]
+name = "chua-engine"
+description = "Protocol-agnostic download engine: task model, segmented transfer, resumable persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
