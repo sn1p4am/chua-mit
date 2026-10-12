@@ -82,11 +82,16 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 
 ---
 
+- [x] **最小 CI 建立**：`fmt` / `clippy` / 分 crate 测试 / 许可门禁 / **clean-room 守卫**
+  - `deny.toml` 把 ADR-0005+0008 编码成可执行检查，并显式点名禁止 `slint` / `libproxy` / `pacparser`
+  - `cleanroom` job 机械执行 `CLEANROOM.md` R1–R4：`crates/` 与 `spec/` 不得出现上游名或
+    copyleft 路径；只查这两处，因为 `CLEANROOM.md` 与 `.omp/` 是来源记录、必须能点名
+  - 守卫已双向验证：当前仓库通过；且确实能抓到真实匹配（首次试跑就在 `.omp/` 命中了 5 处）
+
 ## M0 剩余
 
 - [ ] **人工实测中文输入法**（唯一未验证门槛）：输入框内用微软拼音 / 搜狗 / Rime 各测一遍，
       重点测**靠近窗口下边缘**的输入框（IME issue #64850 的确切触发条件）
-- [ ] 最小 CI（`cargo fmt --check` + `cargo check` + 依赖许可门禁）
 - [ ] 创建 GitHub 远端并推送（**需用户提供新令牌**）
 - [ ] ADR-0003 定稿后补 `spec/ui-v1.md` §9 附录
 

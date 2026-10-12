@@ -53,6 +53,25 @@
 - **R7** 规格必须停在思想层（见 §5）。
 - **R8** 每次实现会话结束，在 §7 追加一行记录。
 
+### 机械执行
+
+R1–R4 不是只靠自觉。`.github/workflows/ci.yml` 的 **`cleanroom` job** 在每次推送时检查
+`crates/` 与 `spec/`：
+
+- 不得出现上游项目名或其组织名（不区分大小写）
+- 不得出现指向 copyleft 目录树的本地路径
+
+只检查 `crates/` 与 `spec/`——`CLEANROOM.md` 与 `.omp/` 是**来源记录**，必须能点名，
+否则本文件就成了自相矛盾的文档。规格也必须干净：一份滑向"描述上游怎么做的"的规格，
+恰恰是这个检查要拦下的失败形态。
+
+本地等价命令（Git 自带 grep）：
+
+```bash
+grep -rniE 'fluxdown|zerx[_-]?lab' crates/ spec/
+grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/
+```
+
 ## 5. 规格审查标准
 
 写规格时逐条自查：

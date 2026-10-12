@@ -39,7 +39,13 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
   - [ ] **重点**：靠近窗口**下边缘**的输入框（IME issue #64850 的确切触发条件）
   - [ ] 100% 与 150% DPI 各测一遍
   - [ ] 中文字体回退无缺字（界面里混排简体、繁体、日文假名、emoji 各看一次）
-- [ ] 最小 CI：`cargo fmt --check` + `cargo check` + 依赖许可门禁（`cargo-deny`）
+- [x] 最小 CI（`.github/workflows/ci.yml`）
+  - [x] `cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
+  - [x] 分 crate 跑测试（按 `AGENTS.md` §6，不用 `--workspace`）
+  - [x] 依赖许可门禁：`deny.toml` + `cargo-deny`，白名单含 ADR-0008 追加的 `Unicode-3.0`，
+        并显式禁止 `slint` / `libproxy` / `pacparser`
+  - [x] **clean-room 守卫**：`crates/` 与 `spec/` 不得出现上游名或 copyleft 路径，
+        本地已双向验证（当前仓库通过；守卫确实能抓到真实匹配）
 - [ ] 创建 GitHub 远端并推送（**需用户提供新令牌**）
 - [ ] ADR-0003 定稿后补 `spec/ui-v1.md` §9 附录
 - [ ] 清理仓库外临时目录（`.buildtest`、`.chua-verify`）

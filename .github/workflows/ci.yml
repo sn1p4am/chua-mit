@@ -1,0 +1,93 @@
+name: ci
+
+# Minimum gate for the project: format, lints, tests, and two policy jobs —
+# `licences` (ADR-0005 / ADR-0008: this project is MIT and must never acquire a
+# copyleft dependency) and `cleanroom` (CLEANROOM.md R1-R4).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt · clippy · test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Tests are run per crate rather than with --workspace, per AGENTS.md §6.
+      - name: cargo test -p chua-engine
+        run: cargo test -p chua-engine
+
+      - name: cargo test -p chua-cli
+        run: cargo test -p chua-cli
+
+  licences:
+    name: licence policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Enforces deny.toml, which encodes the ADR-0005 allowlist plus the
+      # Unicode-3.0 addition from ADR-0008.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  cleanroom:
+    name: clean-room guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole legal position of this project rests on one claim: the code
+      # was written without contact with the copyleft upstream. That claim is
+      # cheap to break by accident (a copied comment, a stray absolute path in
+      # a scratch edit) and expensive to discover late, so it is checked here.
+      #
+      # CLEANROOM.md and .omp/DECISIONS.md are allowed to name the upstream —
+      # they are the provenance record, and being explicit there is required.
+      # The check therefore covers only the shipped artefacts: the code and the
+      # spec that the implementation is written from. A spec that drifts into
+      # describing the upstream instead of the required behaviour is exactly the
+      # failure this is meant to catch.
+      - name: code and spec must not reference the copyleft upstream
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if grep -rniE 'fluxdown|zerx[_-]?lab' crates/ spec/ 2>/dev/null; then
+            echo "::error::crates/ or spec/ names the copyleft upstream"
+            fail=1
+          fi
+
+          if grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/ 2>/dev/null; then
+            echo "::error::a path into the copyleft tree leaked into code or spec"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "See CLEANROOM.md rules R1-R4."
+            exit 1
+          fi
+          echo "ok: crates/ and spec/ are clean"

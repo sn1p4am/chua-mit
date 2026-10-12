@@ -1,0 +1,56 @@
+# Licence and source policy gate.
+#
+# This file encodes ADR-0005 (dependency licence policy) and the one addition
+# made by ADR-0008. It exists so that the project's MIT status cannot be broken
+# by accident — a single copyleft crate in the tree would make the whole
+# distributed binary undistributable under MIT, and that is very hard to notice
+# by reading Cargo.toml files.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Anything not listed here is denied, which is the behaviour we want: new
+# licences must be added deliberately, with a recorded decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    # ADR-0008: arrives unavoidably via url -> idna -> icu_*. Permissive and
+    # OSI-approved, but it is NOT in the original ADR-0005 list, so it is added
+    # here explicitly rather than silently accepted.
+    "Unicode-3.0",
+    # ADR-0005 permits unmodified MPL-2.0. cargo-deny cannot verify
+    # "unmodified", so the rule is: MPL-2.0 crates may be depended on but never
+    # patched or vendored with local changes.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Named so the reason is legible at the point of failure. None of these should
+# ever appear; if one does, the build fails with the ADR that forbids it.
+deny = [
+    # ADR-0008: GPL-3.0-only OR commercial. A real trap for a Rust desktop app.
+    { name = "slint" },
+    # ADR-0008: MIT binding, but the underlying C library is LGPL-2.1.
+    { name = "libproxy" },
+    { name = "pacparser" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Dependencies come from crates.io only, except gpui-fast which is vendored at a
+# pinned git revision (ADR-0007). Add that allowance when the vendoring lands.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
