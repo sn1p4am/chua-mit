@@ -168,30 +168,43 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
 | §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
 
-### 当前阻塞（**交付物尚不可用**）
+### 当前阻塞（**交付物尚不可用**）—— 快照 @ 第 58 轮
 
-1. **`cargo build` 失败，3 个错误**：
-   - `engine/job.rs:612` —— 把 `watch::Sender` 传给了要 `Receiver` 的地方
-   - `engine/mod.rs:287` —— **actor future 不是 `Send`**：`rusqlite::Connection` 是
-     `Send` 但**不是 `Sync`**（内部有 `RefCell`），而 `run` future 跨 await 持有 `&Actor`，
-     故 `tokio::spawn` 要求 `Actor: Sync`。修法见下方"下一步"
-   - `engine/job.rs:796` —— 多余的 `mut` 警告
-2. **`crates/cli` 尚未创建** —— 验收套件需要它才能跑（接口见 `spec/cli-v1.md`）
-3. `engine/mod.rs` 974 行、`engine/job.rs` 约 1000 行，超出 `AGENTS.md` §5 的 600 行指引
+**已解决的**：`Actor: Sync`（改用 `Mutex<Store>`）、`watch` 通道传反、
+`ranges.rs:60` 整数溢出（哨兵值显式处理）、`Content-Disposition` 取末段规则。
+**两个原始挂死已消除**，测试从「无限挂起」变为可跑完。
 
-### 下一步
+**仍未通过**：
 
-先变绿，再谈拆分。修 `Actor: Sync` 的最小改法是把 `store` 放进 `std::sync::Mutex`
-（`Mutex<T>: Sync` 当 `T: Send`，`Connection` 满足），并保持临界区短且不含 await ——
-编译器会强制这一点（guard 是 `!Send`）。然后跑四条命令，再加 CLI。
+1. **第三个挂死，仍在 throttle**：单线程跑时最后一行是
+   `concurrent_reservations_do_not_double_spend`。
+   该函数已是**第三次**出问题（先失败 → 挂死 → 再失败 → 又挂死）。
+   建议停止打补丁，改为「单次强 CAS 推进时间线」结构：重试天然有进展，
+   "重复领取"在结构上不可能发生。详见发给实现会话的消息。
+2. **4 个失败用例**：`throttle::a_faster_rate_shortens_the_wait`（left 4100 / right 0）、
+   `events::eta_refuses_to_guess_from_a_weak_signal`、
+   `filename::mixed_encoding_names`（v1.0.2 的解码顺序）、
+   `job::prepare_target_truncates_to_the_confirmed_count`
+3. **`cargo clippy` 有 2 个 error + 14 个 warning**，两条 error 都是 `AGENTS.md` §5 明文禁止的写法：
+   - `throttle.rs:229` —— `ignoring a result with .ok() is misleading`
+   - `engine/mod.rs:203` —— `let _ = wait.await;`（non-binding let on `#[must_use]`）
+4. **`cargo fmt --all --check` 不干净**：`config.rs:291`、`engine/job.rs:101/218/655/686` 等
+5. **`crates/cli` 尚未创建** —— 验收套件需要它才能跑（接口见 `spec/cli-v1.md`）
+6. `engine/mod.rs` 974 行、`engine/job.rs` 约 1000 行，超出 `AGENTS.md` §5 的 600 行指引
 
 ### 验收工具已就绪
 
 `spec/acceptance/`（服务器 7 种模式 + 6 项检查）已自测通过。
 CLI 一落地即可 `python run.py --cli ...` 得到 M1 的真实结论。
 
-**本轮结论**：规格到实现的传递是有效的（上表 10 项全部命中），
-但**在编译通过之前这些工作的可用价值为零** —— 这一点已如实告知实现会话。
+### 规格侧本轮的三处自我修正
+
+实现侧的失败测试暴露了规格三处缺陷，均已升版并记录起因：
+v1.0.1（取末段 vs 拼接）、v1.0.2（解码必须早于末段判定）。
+**这是 §4.5 流程按设计工作的证据**：失败测试就是缺口报告，比凭想象写规格准得多。
+
+**当前结论**：规格到实现的传递有效（复核表 10 项全部命中，且实现侧多次依规格自纠），
+但**四条命令未全绿之前，M1 不算完成**。
 
 ---
 
