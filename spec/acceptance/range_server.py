@@ -212,14 +212,19 @@ def main() -> int:
     global MODE
     MODE = args.mode
 
-    # Deterministic, incompressible-ish payload derived from the size.
+    # Deterministic payload, built fast. The obvious "chain SHA-256 one block at a
+    # time" is unusably slow at the sizes the throughput baseline needs — 1 GiB
+    # would take tens of millions of hashes. Instead derive one 1 MiB block and
+    # repeat it: still deterministic, still incompressible-ish, and generated in
+    # milliseconds. The server reports its own sha256, so the client's result is
+    # compared against what was actually served either way.
     seed = hashlib.sha256(f"payload-{args.size}".encode()).digest()
-    blocks = []
-    digest = seed
-    for _ in range((args.size // 32) + 1):
-        digest = hashlib.sha256(digest).digest()
-        blocks.append(digest)
-    PAYLOAD = b"".join(blocks)[: args.size]
+    unit = (seed * ((1 << 20) // len(seed) + 1))[: 1 << 20]
+    repeats = args.size // len(unit) + 1
+    PAYLOAD = (unit * repeats)[: args.size]
+
+    # A cheap integrity check that the generation is what we think it is.
+    assert len(PAYLOAD) == args.size, "payload generation produced the wrong length"
 
     with Server(("127.0.0.1", args.port), Handler) as httpd:
         print(f"listening on http://127.0.0.1:{args.port}", flush=True)
