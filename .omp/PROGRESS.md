@@ -54,6 +54,13 @@
 - [x] **依赖生态可行性**：429 个缓存 crate 全量许可普查，**无一个 copyleft**；
   `librqbit` = Apache-2.0（三方印证）；`gpui-fast` 全系 = Apache-2.0
 - [x] **ADR-0003 + ADR-0007：UI 框架定稿为 GPUI / `gpui-fast`**，并已完成 5 项落地实测
+- [x] **ADR-0004：引擎与宿主解耦方式定稿**——事件出口用 `broadcast` channel（不用 trait），
+  配全量快照方法，`Lagged` 即重同步信号；crate 划分 `engine` + `cli`；并发模型为单 actor 串行化
+- [x] **`spec/ui-v1.md` v1.1.0**：追加 §9 实现附录（框架姿态、D3D11 预检硬要求、实测预算、
+  列表增量更新机制、进度条形态决定、中文与输入法补丁、主题与平台能力）
+- [x] **中文输入法测试程序**（仓库外 `.gpui-spike/src/bin/ime_test.rs`，10.6 MB，已验活）
+  - 7 行字体回退检查（含 BMP 之外的代理对、四语混排基线）
+  - 3 个输入框，第 3 个**贴着窗口底边**——IME issue #64850 的确切触发条件
 - [x] **ADR-0008：依赖栈基线**（TLS 单一走 rustls、绝不链接 `libav*`、白名单补 `Unicode-3.0`）
 - [x] **两份调研报告入库**：`.omp/research/gpui-evaluation-report.md`（102 KB）、
   `.omp/research/permissive-rust-stack-report.md`（89 KB），均声明遵守干净室约束
@@ -126,7 +133,19 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | `ee6d28d` | M0：`spec/engine-v1.md` 引擎行为规格 v1.0.0 |
 | `0a9f343` | M0：`spec/ui-v1.md` 界面规格 v1.0.0 |
 | `6a0f6b6` | M0：ADR-0003 有条件选定 GPUI / `gpui-fast` |
-| _（待提交）_ | M0：实测复核 ADR-0007、依赖栈 ADR-0008、报告入库、P-001 踩坑 |
+| `aa70f29` | M0：实测复核 ADR-0007、依赖栈 ADR-0008、报告入库、P-001 踩坑 |
+| _（待提交）_ | M0：ADR-0004 引擎解耦定稿、`spec/ui-v1.md` v1.1.0 实现附录 |
+
+---
+
+## M1 进展
+
+**实现会话已启动（干净会话）**：只读 `spec/`、`CLEANROOM.md`、`.omp/`，
+明确禁止读写任何 copyleft 源码。任务书要求 P0 优先——
+工作区骨架 + 任务状态机 + 探测 + 分段下载 + 持久化与续传 + 事件出口 + 本地 range server 集成测试，
+并要求**必须覆盖「服务器对 Range 请求返回 200 而不是 206」**这一静默损坏场景。
+
+交付后由规格侧验证（本机增量编译 1.7 秒，验收成本很低），再按里程碑提交。
 
 ---
 
