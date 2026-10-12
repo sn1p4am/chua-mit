@@ -115,6 +115,17 @@ impl TaskState {
                 | Self::Verifying,
                 Self::Removed,
             ) => true,
+            // {Completed,Failed} -> Removed             remove
+            //
+            // §3.2 lists only "非终态 -> Removed", and read literally that
+            // leaves a finished or failed task undeletable forever: `remove` is
+            // how a user clears a task out of the list, and the tasks a user
+            // wants to clear are precisely the ones that are done. §3.1's
+            // "terminal states MUST NOT leave on their own" is about automatic
+            // departure; a host-issued remove is an explicit instruction, the
+            // same shape as the `Failed -> Probing` retry the table already
+            // allows out of a terminal state. Logged in `.omp/TODO.md`.
+            (Self::Completed | Self::Failed, Self::Removed) => true,
             // Self-transitions are not in the table and are not implied by it.
             _ => false,
         }
@@ -184,7 +195,7 @@ mod tests {
     ];
 
     /// Every edge written out in §3.2, expanded.
-    const LEGAL: [(TaskState, TaskState); 21] = [
+    const LEGAL: [(TaskState, TaskState); 23] = [
         (TaskState::Created, TaskState::Probing),
         (TaskState::Probing, TaskState::Queued),
         (TaskState::Probing, TaskState::Failed),
@@ -206,6 +217,10 @@ mod tests {
         (TaskState::Downloading, TaskState::Removed),
         (TaskState::Paused, TaskState::Removed),
         (TaskState::Verifying, TaskState::Removed),
+        // Terminal states keep exactly one other way out: the user deleting the
+        // task. See the comment on the table entry.
+        (TaskState::Completed, TaskState::Removed),
+        (TaskState::Failed, TaskState::Removed),
     ];
 
     fn is_listed(from: TaskState, to: TaskState) -> bool {
@@ -284,11 +299,16 @@ mod tests {
     }
 
     #[test]
-    fn no_terminal_state_has_an_outgoing_edge_except_retry() {
+    fn a_terminal_state_leaves_only_on_an_explicit_instruction() {
         for state in ALL.iter().copied().filter(|s| s.is_terminal()) {
             for to in ALL {
                 let legal = state.can_transition_to(to);
-                let allowed = state == TaskState::Failed && to == TaskState::Probing;
+                // Two explicit host instructions, and nothing else: retry a
+                // failed task, delete a task. Neither is the state machine
+                // drifting on its own, and `Removed -> Removed` is still not an
+                // edge — a task can only be deleted once.
+                let allowed = (to == TaskState::Removed && to != state)
+                    || (state == TaskState::Failed && to == TaskState::Probing);
                 assert_eq!(legal, allowed, "{state} -> {to}");
             }
         }

@@ -5,10 +5,9 @@
 //! [`crate::engine::ranges::validate_range_response`] first. There is no second
 //! path to the file.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::engine::ranges::{RangeRequest, validate_range_response, verdict_failure};
@@ -319,8 +318,20 @@ pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> Segm
         let chunk = match chunk {
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
-                // The body ended early. Either the server clamped the range or
-                // it truncated; both are a re-plan, never a silent short write.
+                // The body ended. With a known length that is either a clamped
+                // range or a truncated response, and both are a re-plan rather
+                // than a silent short write.
+                //
+                // In unknown-length mode there is no expected length to fall
+                // short of: the request was the open-ended `bytes=0-` of §4.3
+                // and the close of the connection is what delimits the
+                // representation, so reaching the end of the body *is*
+                // completion. The caller adopts the length it turned out to
+                // have.
+                if plan.total_len.is_none() {
+                    record_complete(context, id);
+                    return SegmentOutcome::Done { id };
+                }
                 return SegmentOutcome::Rejected {
                     id,
                     failure: Failure::new(
@@ -440,42 +451,41 @@ pub async fn wait_for_stop(stop: &watch::Receiver<bool>) {
 /// Returns once every segment has finished, the layout has to be re-planned, or
 /// the transfer was stopped. The caller decides what the task's next state is.
 ///
-/// Each lane pulls the next plan off a shared queue, so a lane that finishes
-/// early takes over work rather than idling, and a lane that has nothing left
-/// parks until the caller aborts it. One rejected segment aborts the pass: the
-/// caller's remedy for a bad interval response is to re-probe and re-plan, not
-/// to keep hammering the same endpoint.
+/// Each outstanding segment gets its own lane and a permit bounds how many run
+/// at once. Every lane therefore returns exactly once, which is what lets the
+/// join loop below know the pass is over — an earlier version kept lanes alive
+/// on a shared work queue and parked the idle ones on a future that never
+/// completes, so a fully successful pass never returned at all.
+///
+/// One rejected segment aborts the pass: the caller's remedy for a bad interval
+/// response is to re-probe and re-plan, not to keep hammering the same endpoint.
 pub async fn run_layout(
     context: TransferContext,
     segments: Vec<SegmentState>,
     total_len: Option<u64>,
     concurrency: usize,
 ) -> LayoutOutcome {
-    let queue: Arc<Mutex<VecDeque<SegmentPlan>>> =
-        Arc::new(Mutex::new(plans_for(&segments, total_len).into()));
+    let plans = plans_for(&segments, total_len);
+    // Nothing left to fetch. Returning here also covers the zero-length file,
+    // whose layout has no segments at all.
+    if plans.is_empty() {
+        return LayoutOutcome::Finished;
+    }
 
+    let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut lanes: JoinSet<SegmentOutcome> = JoinSet::new();
-    for _ in 0..concurrency.max(1) {
+    for plan in plans {
         let context = context.clone();
-        let queue = Arc::clone(&queue);
+        let permits = Arc::clone(&permits);
         lanes.spawn(async move {
-            loop {
-                let plan = match queue.lock() {
-                    Ok(mut queue) => queue.pop_front(),
-                    // A poisoned queue means another lane panicked. Leaving the
-                    // lane with no work is the safe reading; the caller will
-                    // re-plan from durable state anyway.
-                    Err(_) => None,
-                };
-                let Some(plan) = plan else {
-                    std::future::pending::<()>().await;
-                    continue;
-                };
-                let outcome = fetch_segment(&context, plan).await;
-                if !matches!(outcome, SegmentOutcome::Done { .. }) {
-                    return outcome;
-                }
-            }
+            let id = plan.id;
+            let Ok(_permit) = permits.acquire_owned().await else {
+                // Only `run_layout` closes the semaphore, and it cannot return
+                // while a lane is still running, so this is unreachable in
+                // practice; reporting it as a stop is the safe reading.
+                return SegmentOutcome::Stopped { id };
+            };
+            fetch_segment(&context, plan).await
         });
     }
 
@@ -503,8 +513,8 @@ pub async fn run_layout(
             }
         }
     }
-    // Every lane currently parked on `pending()` is aborted here, so this
-    // cannot hang waiting for work that will never arrive.
+    // Lanes that were aborted above, and lanes that had not yet taken a permit.
+    // Waiting for them here is what makes the pass's return value trustworthy.
     lanes.shutdown().await;
 
     match (rejection, stopped) {

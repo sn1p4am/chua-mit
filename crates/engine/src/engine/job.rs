@@ -296,13 +296,71 @@ pub async fn run(mut context: WorkerContext) {
         let outcome = run_once(&mut context, state).await;
         match outcome {
             StepOutcome::Finished => break,
-            StepOutcome::Failed => break,
+            StepOutcome::Failed => {
+                // The task is dead. Whatever the file holds beyond the bytes
+                // that were confirmed durable cannot be attributed to an
+                // interval, and leaving it in place would leave a file that
+                // looks complete at the destination of a download that failed —
+                // the one outcome this project is built to avoid.
+                discard_unconfirmed_tail(&context);
+                break;
+            }
             StepOutcome::Restart(next) => {
                 state = next;
             }
         }
     }
     context.report(JobReportKind::Done);
+}
+
+/// Drop the part of the target file that no interval can vouch for.
+///
+/// Only reached when a task is giving up for good. §7.3(5) already says that a
+/// file disagreeing with the segment record is to be read conservatively, and
+/// the alternative here is worse than conservative: a full-size file of
+/// arbitrary bytes sitting at the destination of a download that failed is
+/// indistinguishable from a completed one to everything except a checksum.
+///
+/// Everything that was confirmed durable is kept, because that is what a later
+/// resume re-uses. Note that the retained prefix may contain holes — bytes
+/// belonging to a segment that never ran — which is harmless: resume drives off
+/// the per-segment durable positions, not off the file's length, so those
+/// intervals are fetched again.
+fn discard_unconfirmed_tail(context: &WorkerContext) {
+    let confirmed = match context.board.lock() {
+        Ok(board) => {
+            if board.all_complete() {
+                // Every byte was fetched and confirmed, so the failure is not a
+                // reason to throw the data away.
+                return;
+            }
+            board
+                .snapshot_segments()
+                .iter()
+                .map(|segment| segment.start.saturating_add(segment.durable_len()))
+                .max()
+                .unwrap_or(0)
+        }
+        Err(_) => return,
+    };
+    let path = &context.record.target_path;
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        // Either the task never got as far as creating a file, or the path is
+        // not a file at all (a task that failed during the probe still carries
+        // its destination *directory*). Neither is made worse by doing nothing.
+        Err(error) => {
+            tracing::debug!(path = %path.display(), kind = ?error.kind(), "nothing to trim");
+            return;
+        }
+    };
+    if let Err(error) = file.set_len(confirmed) {
+        tracing::warn!(
+            path = %path.display(),
+            kind = ?error.kind(),
+            "could not drop the unconfirmed tail"
+        );
+    }
 }
 
 /// Wait for the actor to ask for work again. Returns `false` when the worker
@@ -400,6 +458,12 @@ async fn run_probe_and_transfer(context: &mut WorkerContext, state: TaskState) -
     let total_len = context.record.total_len;
     let use_ranges = context.record.range_supported && total_len.is_some();
     let layout = layout_for(context, use_ranges);
+    // The layout the pass below runs over has to be the worker's own record of
+    // it, not a local: the completeness check after the pass, the retry path
+    // and the segment reports all read `record.segments`, and a layout that
+    // lived only in a local made every one of them see an empty task that
+    // finished instantly with nothing written.
+    context.record.segments = layout.clone();
     context.report(JobReportKind::Segments {
         segments: layout.clone(),
     });
@@ -646,8 +710,7 @@ async fn transfer_loop(
                 if let Err(join_error) = flusher.await {
                     tracing::warn!(?join_error, "flush task ended abnormally");
                 }
-                flush_once(&context.board, &transfer_context.file);
-                report_progress(context);
+                settle_progress(context, &transfer_context.file);
                 return match phase {
                     JobPhase::Stop => StepOutcome::Finished,
                     _ => StepOutcome::Restart(TaskState::Queued),
@@ -658,14 +721,18 @@ async fn transfer_loop(
             tracing::trace!(?error, "stop signal had no receiver");
         }
         // Flush what the transfer wrote before reading the durable positions.
-        flush_once(&context.board, &transfer_context.file);
         if let Err(join_error) = flusher.await {
             tracing::warn!(?join_error, "flush task ended abnormally");
         }
-        report_progress(context);
+        settle_progress(context, &transfer_context.file);
 
         match outcome {
-            LayoutOutcome::Finished => {}
+            LayoutOutcome::Finished => {
+                // §4.3: a close-delimited body has just said how long the
+                // representation is. Adopt it before the completeness check,
+                // which compares against a finite interval.
+                adopt_observed_length(context);
+            }
             LayoutOutcome::Stopped => return StepOutcome::Restart(TaskState::Queued),
             LayoutOutcome::Rejected { failure } => {
                 if failure.kind != FailureKind::DataMismatch {
@@ -782,6 +849,52 @@ async fn transfer_loop(
     }
 }
 
+/// Adopt the length a close-delimited body turned out to have (`§4.3`).
+///
+/// Unknown-length mode asks for the whole representation as one open-ended
+/// segment, so the segment is only known to be finished once the body ends and
+/// the length it turned out to have is the length of the file. Closing the
+/// interval here is what lets everything downstream — the completeness check,
+/// the persisted layout, a later resume — work on a finite range. Nothing is
+/// discarded: the bytes already written become the durable prefix of exactly
+/// the same interval.
+fn adopt_observed_length(context: &mut WorkerContext) {
+    if context.record.total_len.is_some() {
+        return;
+    }
+    let open = match context.board.lock() {
+        Ok(board) => board.snapshot_segments().into_iter().next(),
+        Err(_) => None,
+    };
+    let Some(open) = open else {
+        return;
+    };
+    // Only the open-ended sentinel of unknown-length mode is adopted. A known
+    // length is fixed for the life of the task (§I2) and is never derived from
+    // what happened to arrive.
+    if open.end != u64::MAX {
+        return;
+    }
+    let total = open.durable_end.map_or(0, |end| end.saturating_add(1));
+    context.record.total_len = Some(total);
+    context.record.segments = if total == 0 {
+        Vec::new()
+    } else {
+        vec![SegmentState {
+            id: open.id,
+            start: 0,
+            end: total - 1,
+            durable_end: Some(total - 1),
+        }]
+    };
+    context.report(JobReportKind::Segments {
+        segments: context.record.segments.clone(),
+    });
+    if let Ok(mut board) = context.board.lock() {
+        *board = ProgressBoard::new(&context.record.segments);
+    }
+}
+
 /// Reopen the target for the transfer.
 fn open_for_transfer(path: &std::path::Path) -> Result<std::fs::File, Failure> {
     std::fs::OpenOptions::new()
@@ -837,6 +950,49 @@ fn flush_once(
         tracing::warn!(kind = ?error.kind(), "target flush failed");
     }
     transfer::mark_durable(board)
+}
+
+/// Make the worker's own view of the task agree with what is on disk, then tell
+/// the actor about it.
+///
+/// Three things have to happen in this order and none of them may be skipped:
+///
+/// 1. the file is flushed, so the bytes are actually there;
+/// 2. the confirmed positions are pulled *back* from the board into the worker's
+///    own layout;
+/// 3. the actor is told, so the store and the host's view move with them.
+///
+/// Step 2 is the one that is easy to leave out, and leaving it out is not a
+/// small omission: the board is where a transfer records progress (it is
+/// updated under the file lock by the lane that wrote each chunk) while the
+/// completeness check and every re-plan read `record.segments`. Two copies of
+/// one fact, and if only the board advances then every finished pass looks
+/// unfinished — the worker re-plans from a layout with no durable progress,
+/// throws away everything it fetched and starts again, forever.
+fn settle_progress(context: &mut WorkerContext, file: &Arc<Mutex<std::fs::File>>) {
+    flush_once(&context.board, file);
+    sync_record_from_board(context);
+    report_progress(context);
+}
+
+/// Copy the board's confirmed durable positions into the worker's layout.
+///
+/// Matched by segment id rather than by position: `record.segments` is the
+/// authority on *which intervals exist* (invariant I1) and the board is the
+/// authority on *how much of each is durable*.
+fn sync_record_from_board(context: &mut WorkerContext) {
+    let Ok(board) = context.board.lock() else {
+        return;
+    };
+    let confirmed = board.snapshot_segments();
+    for segment in &mut context.record.segments {
+        if let Some(fresh) = confirmed
+            .iter()
+            .find(|candidate| candidate.id == segment.id)
+        {
+            segment.durable_end = fresh.durable_end;
+        }
+    }
 }
 
 fn report_progress(context: &WorkerContext) {

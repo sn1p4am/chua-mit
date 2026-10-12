@@ -117,7 +117,14 @@ impl Store {
 
         let store = Self { conn };
         store.write_meta("schema_version", &SCHEMA_VERSION.to_string())?;
-        store.write_meta("next_task_id", "1")?;
+        // The counter is initialised once and then owned by the store. Writing
+        // it unconditionally on every open looks harmless and is not: each new
+        // host process would hand out id 1 again, and the second task would
+        // upsert straight over the first one's record — the same id meaning two
+        // different downloads, with the earlier one's state silently lost.
+        if store.read_meta_u64("next_task_id")?.is_none() {
+            store.write_meta("next_task_id", "1")?;
+        }
         Ok(store)
     }
 
@@ -491,6 +498,28 @@ mod tests {
         assert_eq!(store.next_task_id().unwrap(), TaskId(1));
         assert_eq!(store.next_task_id().unwrap(), TaskId(2));
         assert_eq!(store.next_task_id().unwrap(), TaskId(3));
+    }
+
+    #[test]
+    fn task_ids_keep_going_up_across_reopens() {
+        // A second host process must not re-issue an id that is already in the
+        // store: `save_task` upserts, so the collision would overwrite a task
+        // that is still perfectly alive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.db");
+        let (first, second) = {
+            let mut store = Store::open(&path).unwrap();
+            let first = store.next_task_id().unwrap();
+            store.save_task(&record(1, TaskState::Completed)).unwrap();
+            drop(store);
+            let mut reopened = Store::open(&path).unwrap();
+            let second = reopened.next_task_id().unwrap();
+            (first, second)
+        };
+        assert_eq!(first, TaskId(1));
+        assert_eq!(second, TaskId(2), "the counter was reset by reopening");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
     }
 
     #[test]

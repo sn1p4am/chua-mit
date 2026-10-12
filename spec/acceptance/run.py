@@ -115,14 +115,20 @@ def run_cli(
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
+            # Decode explicitly as UTF-8. With bare `text=True` Python uses the
+            # locale codec, which on a Chinese Windows install is GBK — so any
+            # non-ASCII output from the CLI (a filename, a translated message)
+            # kills the reader thread with UnicodeDecodeError. `errors="replace"`
+            # keeps a decoding problem from being reported as a CLI failure.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         return completed.returncode, (completed.stdout + completed.stderr)
     except subprocess.TimeoutExpired as expired:
         out = (expired.stdout or b"") + (expired.stderr or b"")
         if isinstance(out, bytes):
-            out = out.decode(errors="replace")
+            out = out.decode("utf-8", errors="replace")
         return 124, out + "\n<timed out>"
     except OSError as error:
         return 127, f"could not launch {cli!r}: {error}"
@@ -155,7 +161,14 @@ def main() -> int:
         help="the CLI command, e.g. --cli path/to/chua-cli.exe "
         "or --cli python fake_cli.py",
     )
-    parser.add_argument("--port", type=int, default=8731)
+    parser.add_argument(
+        "--port", type=int, default=8731, help="port for the local test server"
+    )
+    parser.add_argument(
+        "--work",
+        default=None,
+        help="scratch directory (default: ./.accept-work next to this script)",
+    )
     args = parser.parse_args()
 
     cli: list[str] = list(args.cli)
@@ -174,12 +187,26 @@ def main() -> int:
         return 2
 
     result = Result()
-    work = Path(tempfile.mkdtemp(prefix="chua-accept-"))
+    # Deliberately NOT the system temp directory. On this machine `%TEMP%` has
+    # broken permission entries (P-001), and the failures it causes are
+    # misleading: `tempfile` cannot create the scratch directory, and SQLite
+    # cannot create its state file inside it, so the CLI reports
+    # "cannot open the state directory" and it looks like an engine bug. The
+    # default is a directory beside this script, which is on the same
+    # permission-clean volume as the repository.
+    if args.work:
+        work_root = Path(args.work).resolve()
+    else:
+        work_root = HERE / ".accept-work"
+    shutil.rmtree(work_root, ignore_errors=True)
+    work_root.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="run-", dir=work_root))
     server = subprocess.Popen(
         [sys.executable, str(SERVER), "--port", str(args.port), "--size", str(PAYLOAD_SIZE)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     try:
         if not wait_for_port(args.port, server):

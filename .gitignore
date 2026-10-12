@@ -35,3 +35,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Acceptance harness scratch (must not live in %TEMP%, see P-001)
+spec/acceptance/.accept-work/

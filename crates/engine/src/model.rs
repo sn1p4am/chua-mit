@@ -90,8 +90,12 @@ impl SegmentState {
     }
 
     /// Total bytes in the interval.
+    ///
+    /// Saturating throughout: unknown-length mode represents "the rest of the
+    /// representation" as `end == u64::MAX` (§4.3), so an interval whose length
+    /// is not representable has to report `u64::MAX` rather than overflow.
     pub const fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start) + 1
+        self.end.saturating_sub(self.start).saturating_add(1)
     }
 
     /// Whether the interval is empty (defensive).
@@ -102,7 +106,7 @@ impl SegmentState {
     /// Durable bytes in this segment.
     pub fn durable_len(&self) -> u64 {
         match self.durable_end {
-            Some(end) if end >= self.start => end - self.start + 1,
+            Some(end) if end >= self.start => end.saturating_sub(self.start).saturating_add(1),
             _ => 0,
         }
     }
@@ -110,7 +114,7 @@ impl SegmentState {
     /// The next byte that still has to be fetched.
     pub fn next_offset(&self) -> u64 {
         match self.durable_end {
-            Some(end) if end >= self.start => end + 1,
+            Some(end) if end >= self.start => end.saturating_add(1),
             _ => self.start,
         }
     }

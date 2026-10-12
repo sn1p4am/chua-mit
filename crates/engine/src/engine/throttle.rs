@@ -2,15 +2,46 @@
 //!
 //! Two independent pieces:
 //!
-//! * [`TokenBucket`] —smooth pacing. A bucket, not a burst-then-sleep, because
-//!   §9.1 forbids the pulse that long sleeps produce.
-//! * [`RateWindow`] —a sliding-window throughput estimate. Total bytes over
+//! * [`Pacer`] — smooth pacing, built on **one** number: the instant at which
+//!   the next byte is free. §9.1's first invariant forbids keeping a token
+//!   balance *and* a reserved timeline, because the two advance independently
+//!   and end up disagreeing about how much has been paid for. There is only a
+//!   timeline here; nothing else records what has been spent.
+//! * [`RateWindow`] — a sliding-window throughput estimate. Total bytes over
 //!   total time is explicitly rejected by §9.2: it makes a long transfer
 //!   unresponsive to recent change.
 //!
 //! Both are shared by `Arc` because every segment of a task runs concurrently.
-//! The bucket keeps its state in atomics so that acquiring a token never holds a
+//! The pacer keeps its state in atomics so that acquiring a slot never holds a
 //! lock across an await point.
+//!
+//! # How the timeline works
+//!
+//! `reserved_until` is the instant at which every byte reserved so far has been
+//! paid for. A caller claims the interval that starts there and is as long as
+//! its own bytes require, and the time it is told to wait is the end of its own
+//! interval — so the bytes leave once they have been paid for. That single rule
+//! gives all five of §9.1's invariants:
+//!
+//! 1. one source of truth, because there is one atomic;
+//! 2. the aggregate of `N` bytes can never leave before `N / rate`, and it never
+//!    lags by more than the caller's own final claim;
+//! 3. concurrent callers claim disjoint intervals — the compare-exchange hands
+//!    each one the tail it read — so the total time grows linearly with the
+//!    number of callers instead of shrinking;
+//! 4. every retry of that compare-exchange observes a strictly larger value,
+//!    because a successful claim only ever moves the mark forwards, so the loop
+//!    cannot spin;
+//! 5. changing the rate touches only the price of *future* claims: the mark, and
+//!    with it every interval already handed out, is left alone.
+//!
+//! The one exception to "wait for your own interval" is a single allowance of
+//! one second granted when pacing starts, which is §9.1's permitted initial
+//! deferral ("wait then send" and "send then wait" have the same average rate)
+//! expressed on the timeline. It does not make the transfer faster: the
+//! allowance is spent from the mark like any other claim, so the next caller
+//! pays for both and the average over anything longer than one claim is exactly
+//! the configured rate.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -21,64 +52,73 @@ use std::time::{Duration, Instant};
 /// a sleep measured in years.
 const MAX_PACING_WAIT: Duration = Duration::from_secs(60 * 60 * 24);
 
-/// A token bucket that refills linearly. One token is one byte, so a bucket
-/// sized to half a second of traffic absorbs normal jitter without allowing a
-/// visible burst.
+/// One-shot deferral granted when pacing starts: the first claim after that is
+/// not delayed. §9.1 allows an initial delay of one block; this is that
+/// allowance, and it is granted once rather than per claim so that the ceiling
+/// still holds in aggregate.
+const INITIAL_ALLOWANCE: u64 = 1_000_000_000;
+
+/// A single-timeline pacer. One token is one byte, and the only state is the
+/// instant at which the next byte is free.
 #[derive(Debug)]
-pub struct TokenBucket {
+pub struct Pacer {
     /// Nanoseconds of wall time per byte at the current rate. Zero means
     /// unlimited.
     nanos_per_byte: AtomicU64,
-    /// Tokens available right now, minted by [`TokenBucket::mint`].
-    tokens: AtomicU64,
-    /// Instant the token count was last reconciled, in nanoseconds since
-    /// `origin`.
-    token_stamp: AtomicU64,
-    /// When the next byte that has to wait will be paid for. Only touched on the
-    /// waiting path.
+    /// Instant at which everything reserved so far has been paid for, in
+    /// nanoseconds since `origin`. Only ever moves forwards while a rate is
+    /// set, which is what makes the claim loop below terminate.
     reserved_until: AtomicU64,
-    /// Burst capacity in bytes.
-    capacity: AtomicU64,
+    /// Remaining one-shot deferral, in nanoseconds. Not a balance: it is never
+    /// topped up by traffic, never consulted to answer "how much has been paid
+    /// for", and only ever goes from its initial value to zero.
+    allowance: AtomicU64,
     origin: Instant,
 }
 
-impl TokenBucket {
-    /// A bucket pacing `bytes_per_second`. `None` means unlimited.
+impl Pacer {
+    /// A pacer limiting to `bytes_per_second`. `None` means unlimited.
     pub fn new(bytes_per_second: Option<u64>) -> Self {
-        let bucket = Self {
+        let pacer = Self {
             nanos_per_byte: AtomicU64::new(0),
-            tokens: AtomicU64::new(0),
-            token_stamp: AtomicU64::new(0),
             reserved_until: AtomicU64::new(0),
-            capacity: AtomicU64::new(0),
+            allowance: AtomicU64::new(0),
             origin: Instant::now(),
         };
-        bucket.set_rate(bytes_per_second);
-        bucket
+        // Starts from zero, so this also arms the deferral and the clock.
+        pacer.set_rate(bytes_per_second);
+        pacer
     }
 
     /// Change the rate while running. §9.1 requires the change to take effect
-    /// without restarting the transfer, so this is a plain store.
+    /// without restarting the transfer.
+    ///
+    /// Only the price of later claims changes. The mark is deliberately left
+    /// where it is: it *is* the set of intervals already handed out, and moving
+    /// it back would let a later caller claim time that an earlier one is
+    /// already waiting for — the double-booking §9.1's third invariant forbids.
+    /// The cost of that choice is that raising the rate does not shorten a
+    /// backlog that was booked at the old one; the backlog is bounded by the
+    /// claims already in flight, which is one block per transfer lane.
+    ///
+    /// Switching pacing on from off is different: that starts the clock, so the
+    /// mark is reset to now and the deferral is granted afresh.
     pub fn set_rate(&self, bytes_per_second: Option<u64>) {
+        let previous = self.nanos_per_byte.load(Ordering::Relaxed);
         match bytes_per_second {
             Some(rate) if rate > 0 => {
                 // Nanoseconds per byte, rounded up so the pacing is never faster
                 // than the rate that was asked for.
                 let nanos = 1_000_000_000u64.div_ceil(rate).max(1);
-                let capacity = (rate / 2).max(1);
                 self.nanos_per_byte.store(nanos, Ordering::Relaxed);
-                self.capacity.store(capacity, Ordering::Relaxed);
-                // Start full, and start the pacing clock now, so a rate change
-                // does not mint for the interval that elapsed at the old one.
-                let now = self.now_nanos();
-                self.tokens.store(capacity, Ordering::Relaxed);
-                self.token_stamp.store(now, Ordering::Release);
-                self.reserved_until.store(now, Ordering::Release);
+                if previous == 0 {
+                    self.reserved_until
+                        .store(self.now_nanos(), Ordering::Release);
+                    self.allowance.store(INITIAL_ALLOWANCE, Ordering::Release);
+                }
             }
             _ => {
                 self.nanos_per_byte.store(0, Ordering::Relaxed);
-                self.capacity.store(0, Ordering::Relaxed);
-                self.tokens.store(0, Ordering::Relaxed);
             }
         }
     }
@@ -89,40 +129,18 @@ impl TokenBucket {
         (nanos > 0).then(|| 1_000_000_000u64 / nanos)
     }
 
-    /// Whether the bucket is currently unlimited.
+    /// Whether the pacer is currently unlimited.
     pub fn is_unlimited(&self) -> bool {
         self.nanos_per_byte.load(Ordering::Relaxed) == 0
     }
 
-    /// Claim `bytes` worth of pacing and report how long the caller must wait.
+    /// Claim `bytes` worth of the timeline and report how long the caller must
+    /// wait before sending them.
     ///
-    /// Two mechanisms, each covering what the other handles badly. The wait a
-    /// caller gets is the **shorter** of the two, so neither can over-charge:
-    ///
-    /// * **Tokens.** A count that [mint]s at the configured rate up to one burst
-    ///   window. If the bytes are on hand, the wait is nothing. If they are not,
-    ///   the shortfall priced at the rate is the honest wait — and it is the
-    ///   binding one for small shortfalls, which is why it cannot be dropped.
-    /// * **The timeline.** `reserved_until` is the instant at which everything
-    ///   reserved so far has been paid for; a caller appends its cost and the
-    ///   tail it read is the start of its slot. This is what makes concurrent
-    ///   callers queue instead of all being told the same shortfall and then all
-    ///   proceeding at once, which would let the aggregate rate exceed the
-    ///   ceiling.
-    ///
-    /// The timeline is clamped to one burst window behind the present. That
-    /// single clamp bounds the burst (idle time cannot bank an unlimited
-    /// allowance, so §9.1's "no pulse" holds) and bounds the wait (a caller that
-    /// inherits a slot already in the past waits for nothing, so a backlog
-    /// cannot grow without limit).
-    ///
-    /// Termination: the tokens and the timeline are each updated by one
-    /// compare-exchange whose retry reloads the value reported by the failed
-    /// exchange, and each successful update moves that value forward. The cost
-    /// is computed from a single observation, never from a value a previous step
-    /// has already drained — an earlier version did exactly that, saturated the
-    /// cost to `u64::MAX`, and made the comparison unsatisfiable. That is why
-    /// the cost here is derived from `bytes` alone.
+    /// The claim is one compare-exchange. It succeeds against the value it read
+    /// and installs a strictly larger one, so a retry always sees fresh state
+    /// and the loop is bounded by the number of racing claims rather than by
+    /// anything about the inputs.
     pub fn reserve(&self, bytes: u64) -> Duration {
         let nanos_per_byte = self.nanos_per_byte.load(Ordering::Relaxed);
         if nanos_per_byte == 0 || bytes == 0 {
@@ -132,153 +150,49 @@ impl TokenBucket {
         if cost == 0 {
             return Duration::ZERO;
         }
-        let capacity = self.capacity.load(Ordering::Relaxed);
+
         let now = self.now_nanos();
-        self.mint(now, capacity, nanos_per_byte);
-
-        // One observation, used for both the attempt to take and the shortfall.
-        let observed = self.tokens.load(Ordering::Acquire);
-        if observed >= bytes && self.take(bytes, observed) {
-            return Duration::ZERO;
-        }
-
-        // What the bucket could not cover, priced at the rate.
-        let shortfall = bytes.saturating_sub(self.tokens.load(Ordering::Acquire));
-        let via_tokens = Duration::from_nanos(shortfall.saturating_mul(nanos_per_byte));
-
-        // The timeline reserves only the shortfall, not the whole cost. The
-        // tokens have already paid for part of the claim; charging the timeline
-        // for the same bytes again would double-count them, and it also gets the
-        // queue's arithmetic wrong — reserving the full cost makes each waiter
-        // wait for its *own* size while the mark advances by that size, so the
-        // queue never actually spreads.
-        let via_timeline = self.append_to_timeline(shortfall.saturating_mul(nanos_per_byte), now);
-        via_tokens.min(via_timeline).min(MAX_PACING_WAIT)
-    }
-
-    /// Take `bytes` if the count is still `observed`.
-    fn take(&self, bytes: u64, observed: u64) -> bool {
-        self.tokens
-            .compare_exchange(
-                observed,
-                observed - bytes,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    /// Append `reservation` to the pacing timeline and report the wait until the
-    /// caller's own slot begins.
-    ///
-    /// The floor is `now`: the timeline may never be treated as being in the
-    /// past, so a caller can never inherit a slot that has already expired. The
-    /// burst allowance lives in the token count instead, which is the right
-    /// place for it — the timeline's only job is to keep the *aggregate* of
-    /// concurrent callers inside the rate. Getting this floor wrong is subtle:
-    /// clamping to `now - window` instead makes the timeline start behind the
-    /// present, so every caller is handed a slot that has already passed and the
-    /// wait collapses to zero, which silently disables pacing altogether.
-    fn append_to_timeline(&self, reservation: u64, now: u64) -> Duration {
         let mut current = self.reserved_until.load(Ordering::Acquire);
-        loop {
+        let end = loop {
+            // The mark may sit in the past when the pacer has been idle; a
+            // claim then starts now rather than inheriting idle time as credit.
             let start = current.max(now);
-            let proposed = start.saturating_add(reservation);
-            match self.reserved_until.compare_exchange(
+            let proposed = start.saturating_add(cost);
+            match self.reserved_until.compare_exchange_weak(
                 current,
                 proposed,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Duration::from_nanos(start.saturating_sub(now)),
-                // Another caller appended; the value it reports is fresh, so the
-                // next attempt compares against new state.
+                Ok(_) => break proposed,
+                // Another caller claimed first. What it installed is strictly
+                // larger than what we read, so this cannot loop forever, and
+                // its claim and ours never overlap.
                 Err(actual) => current = actual,
             }
-        }
-    }
+        };
 
-    /// Add the tokens that have accrued since the last reconciliation, keeping
-    /// the sub-token remainder so a slow rate does not round down to zero
-    /// forever.
-    fn mint(&self, now: u64, capacity: u64, nanos_per_byte: u64) {
-        let stamp = self.token_stamp.load(Ordering::Acquire);
-        if now <= stamp {
-            return;
-        }
-        let elapsed = now - stamp;
-        let accrued = elapsed / nanos_per_byte;
-        if accrued == 0 {
-            return;
-        }
-        // `minted <= elapsed`, so this subtraction cannot underflow.
-        let minted = accrued.saturating_mul(nanos_per_byte);
-        let mut current = self.tokens.load(Ordering::Acquire);
-        loop {
-            let proposed = current.saturating_add(accrued).min(capacity);
-            match self.tokens.compare_exchange(
-                current,
-                proposed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                // Bounded: only another mint can race here, and a mint adds at
-                // most one burst.
-                Err(actual) => current = actual,
-            }
-        }
-        // Advance the stamp by the time actually minted, and only ever forwards.
-        let stamp_after = now - (elapsed - minted);
-        let mut observed = self.token_stamp.load(Ordering::Acquire);
-        loop {
-            if observed >= stamp_after {
-                break;
-            }
-            match self.token_stamp.compare_exchange(
-                observed,
-                stamp_after,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => observed = actual,
-            }
-        }
+        // Everything up to `end` has now been paid for by this claim. Waiting
+        // for `end` is what makes the aggregate rate correct; the wait is
+        // measured against the same `now` the claim was priced from.
+        let price = end.saturating_sub(now);
+        let allowance = self.allowance.swap(0, Ordering::AcqRel);
+        Duration::from_nanos(price.saturating_sub(allowance)).min(MAX_PACING_WAIT)
     }
 
     /// Wait until `bytes` may be sent.
     ///
-    /// One reservation, one sleep. There is no re-check loop: the tokens were
+    /// One reservation, one sleep. There is no re-check loop: the interval was
     /// taken up front, so re-reserving would charge the caller twice. A caller
-    /// that has to stop mid-wait is cancelled from outside instead; the transfer
-    /// loop races this future against its stop signal, which is both prompt and
-    /// free of the quadratic behaviour a wake-and-retry loop would have at a low
+    /// that has to stop mid-wait is cancelled from outside; the transfer loop
+    /// races this future against its stop signal, which is both prompt and free
+    /// of the quadratic behaviour a wake-and-retry loop would have at a low
     /// rate.
-    pub async fn acquire_pacing(&self, bytes: u64) {
+    pub async fn acquire(&self, bytes: u64) {
         let wait = self.reserve(bytes);
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
-    }
-
-    /// Wait until `bytes` may be sent. Alias for [`TokenBucket::acquire_pacing`]
-    /// so both names read naturally at their call sites.
-    pub async fn acquire(&self, bytes: u64) {
-        self.acquire_pacing(bytes).await;
-    }
-
-    /// Tokens currently on hand, after accounting for elapsed time. Diagnostic
-    /// only; pacing decisions are made by [`TokenBucket::reserve`].
-    pub fn available(&self) -> u64 {
-        let nanos_per_byte = self.nanos_per_byte.load(Ordering::Relaxed);
-        if nanos_per_byte == 0 {
-            return u64::MAX;
-        }
-        let now = self.now_nanos();
-        let capacity = self.capacity.load(Ordering::Relaxed);
-        self.mint(now, capacity, nanos_per_byte);
-        self.tokens.load(Ordering::Acquire)
     }
 
     fn now_nanos(&self) -> u64 {
@@ -293,7 +207,7 @@ pub type SharedLimiter = Arc<RateLimiter>;
 /// what §9.1 asks for.
 #[derive(Debug)]
 pub struct RateLimiter {
-    bucket: TokenBucket,
+    pacer: Pacer,
     /// The rate the host asked for, kept even while pacing is switched off, so
     /// switching it back on does not lose the setting.
     configured: AtomicU64,
@@ -303,7 +217,7 @@ impl RateLimiter {
     /// A limiter with an initial rate.
     pub fn new(bytes_per_second: Option<u64>) -> Self {
         Self {
-            bucket: TokenBucket::new(bytes_per_second),
+            pacer: Pacer::new(bytes_per_second),
             configured: AtomicU64::new(bytes_per_second.unwrap_or(0)),
         }
     }
@@ -319,7 +233,7 @@ impl RateLimiter {
         if let Some(rate) = bytes_per_second {
             self.configured.store(rate, Ordering::Relaxed);
         }
-        self.bucket.set_rate(bytes_per_second);
+        self.pacer.set_rate(bytes_per_second);
     }
 
     /// The rate currently being paced at; `None` when unlimited.
@@ -330,12 +244,17 @@ impl RateLimiter {
 
     /// Whether pacing is currently off.
     pub fn is_unlimited(&self) -> bool {
-        self.bucket.is_unlimited()
+        self.pacer.is_unlimited()
+    }
+
+    /// Claim `bytes` and report the wait, without sleeping.
+    pub fn reserve(&self, bytes: u64) -> Duration {
+        self.pacer.reserve(bytes)
     }
 
     /// Wait until `bytes` may be sent.
     pub async fn acquire(&self, bytes: u64) {
-        self.bucket.acquire_pacing(bytes).await;
+        self.pacer.acquire(bytes).await;
     }
 }
 
@@ -455,23 +374,25 @@ pub fn effective_limit(global: Option<u64>, per_task: Option<u64>) -> Option<u64
     }
 }
 
-/// Apply both limiters to one chunk. Both must release before the chunk may be
-/// sent, which is what makes the stricter of the two effective.
+/// Apply every ceiling that covers these bytes.
+///
+/// Each limiter is charged exactly once — its own accounting has to see these
+/// bytes to keep its own aggregate honest — and the caller waits for the
+/// longest of the resulting waits rather than for their sum. Waiting for the
+/// sum would make two ceilings of 1 MiB/s produce 0.5 MiB/s, a rate the host
+/// never asked for; §9.1 asks for the stricter of the two.
 pub async fn pace(global: Option<&SharedLimiter>, task: Option<&SharedLimiter>, bytes: u64) {
-    if let Some(limiter) = global
-        && !limiter.bucket.is_unlimited()
-    {
-        limiter.acquire(bytes).await;
+    let mut wait = Duration::ZERO;
+    if let Some(limiter) = global {
+        wait = wait.max(limiter.reserve(bytes));
     }
-    if let Some(limiter) = task
-        && !limiter.bucket.is_unlimited()
-    {
-        limiter.acquire(bytes).await;
+    if let Some(limiter) = task {
+        wait = wait.max(limiter.reserve(bytes));
+    }
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
     }
 }
-
-/// Convenience alias so callers do not have to name the bucket.
-pub type SharedBucket = Arc<TokenBucket>;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -479,60 +400,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unlimited_bucket_never_waits() {
-        let bucket = TokenBucket::new(None);
-        assert!(bucket.is_unlimited());
-        assert_eq!(bucket.reserve(1_000_000), Duration::ZERO);
-        assert_eq!(bucket.rate(), None);
+    fn unlimited_pacer_never_waits() {
+        let pacer = Pacer::new(None);
+        assert!(pacer.is_unlimited());
+        assert_eq!(pacer.reserve(1_000_000), Duration::ZERO);
+        assert_eq!(pacer.rate(), None);
     }
 
     #[test]
-    #[ignore = "KNOWN DEFECT: the pacing arithmetic in reserve lets a limited transfer exceed its ceiling. See the module header and .omp/TODO.md."]
     fn pacing_is_proportional_to_the_rate() {
-        let bucket = TokenBucket::new(Some(1_000_000)); // 1 us per byte
-        assert_eq!(bucket.rate(), Some(1_000_000));
-        // The bucket starts full, so the burst is free.
-        assert_eq!(bucket.reserve(500_000), Duration::ZERO);
-        // Once the burst is spent, a claim has to wait, and the wait is on the
-        // order of the time that claim's bytes would take to accrue.
-        let wait = bucket.reserve(500_000);
-        assert!(wait > Duration::ZERO, "a spent bucket must pace");
+        let pacer = Pacer::new(Some(1_000_000)); // 1 us per byte
+        assert_eq!(pacer.rate(), Some(1_000_000));
+        // Pacing starts with the initial deferral, so the first claim is free.
+        assert_eq!(pacer.reserve(500_000), Duration::ZERO);
+        // Once that is spent, a claim has to wait, and the wait is on the order
+        // of the time that claim's bytes would take to accrue.
+        let wait = pacer.reserve(500_000);
+        assert!(wait > Duration::ZERO, "a spent timeline must pace");
         assert!(wait <= Duration::from_secs(1), "wait was {wait:?}");
         // A smaller claim waits less than a larger one from the same state.
-        let small = TokenBucket::new(Some(1_000_000));
-        let large = TokenBucket::new(Some(1_000_000));
+        let small = Pacer::new(Some(1_000_000));
+        let large = Pacer::new(Some(1_000_000));
         assert_eq!(small.reserve(500_000), Duration::ZERO);
         assert_eq!(large.reserve(500_000), Duration::ZERO);
         assert!(small.reserve(100_000) <= large.reserve(900_000));
     }
 
     #[test]
-    #[ignore = "KNOWN DEFECT: the pacing arithmetic in reserve lets a limited transfer exceed its ceiling. See the module header and .omp/TODO.md."]
     fn a_faster_rate_shortens_the_wait() {
-        // Fresh buckets, and a claim far larger than either burst, so the wait
-        // is dominated by the rate rather than by the burst window.
-        let slow = TokenBucket::new(Some(1_000));
-        let fast = TokenBucket::new(Some(100_000));
+        // Fresh pacers, and a claim far larger than the initial deferral, so the
+        // wait is dominated by the rate rather than by the deferral.
+        let slow = Pacer::new(Some(1_000));
+        let fast = Pacer::new(Some(100_000));
         let slow_wait = slow.reserve(1_000_000);
         let fast_wait = fast.reserve(1_000_000);
         assert!(fast_wait < slow_wait, "{fast_wait:?} !< {slow_wait:?}");
-        // A megabyte is a thousand seconds at 1 kB/s and ten at 100 kB/s. The
-        // bucket's burst covers half a second, so the waits are just under those.
+        // A megabyte is a thousand seconds at 1 kB/s and ten at 100 kB/s, and
+        // the initial deferral is one second of either.
         assert!(slow_wait >= Duration::from_secs(900), "{slow_wait:?}");
         assert!(fast_wait >= Duration::from_secs(9), "{fast_wait:?}");
         assert!(fast_wait <= Duration::from_secs(11), "{fast_wait:?}");
     }
 
     #[test]
-    #[ignore = "KNOWN DEFECT: the pacing arithmetic in reserve lets a limited transfer exceed its ceiling. See the module header and .omp/TODO.md."]
     fn the_pacing_queue_spreads_concurrent_callers_out() {
-        // Four callers each want a megabyte at 1 MB/s, and the whole timeline is
-        // advanced by each one's shortfall in turn. The first inherits the burst
-        // and waits for nothing; the mark then stands a megabyte ahead, so the
-        // rest inherit roughly a second of backlog each and the queue grows.
-        let bucket = TokenBucket::new(Some(1_000_000));
-        let waits: Vec<Duration> = (0..4).map(|_| bucket.reserve(1_000_000)).collect();
-        assert_eq!(waits[0], Duration::ZERO, "the burst is free");
+        // Four callers each want a megabyte at 1 MB/s. The first is covered by
+        // the initial deferral and waits for nothing; each later one claims the
+        // interval after the previous one's, so the queue grows instead of all
+        // four being handed the same answer.
+        let pacer = Pacer::new(Some(1_000_000));
+        let waits: Vec<Duration> = (0..4).map(|_| pacer.reserve(1_000_000)).collect();
+        assert_eq!(waits[0], Duration::ZERO, "the deferral is free");
         for wait in &waits[1..] {
             assert!(
                 *wait > Duration::ZERO,
@@ -540,8 +458,8 @@ mod tests {
             );
         }
         // The timeline holds the queue, so the mark has moved on by the total
-        // backlog: three further megabytes at 1 MB/s.
-        let mark = bucket.reserved_until.load(Ordering::Acquire);
+        // reserved: four megabytes at 1 MB/s.
+        let mark = pacer.reserved_until.load(Ordering::Acquire);
         assert!(mark >= 3_000_000_000, "mark was {mark}");
     }
 
@@ -551,9 +469,9 @@ mod tests {
         // bounded answer. An earlier read-modify-write version of this function
         // could spin on these shapes; this test exists for that.
         for rate in [1u64, 7, 1000, 1_000_000, u64::MAX / 2] {
-            let bucket = TokenBucket::new(Some(rate));
+            let pacer = Pacer::new(Some(rate));
             for bytes in [1u64, 1000, 1_000_000, u64::MAX / 4, u64::MAX] {
-                let wait = bucket.reserve(bytes);
+                let wait = pacer.reserve(bytes);
                 assert!(
                     wait <= MAX_PACING_WAIT,
                     "rate {rate} bytes {bytes} gave {wait:?}"
@@ -564,47 +482,60 @@ mod tests {
 
     #[test]
     fn the_rate_can_change_while_running() {
-        let bucket = TokenBucket::new(Some(1000));
-        assert_eq!(bucket.reserve(0), Duration::ZERO);
-        bucket.set_rate(Some(1_000_000));
-        assert_eq!(bucket.rate(), Some(1_000_000));
-        bucket.set_rate(None);
-        assert!(bucket.is_unlimited());
-        assert_eq!(bucket.reserve(1_000_000), Duration::ZERO);
+        let pacer = Pacer::new(Some(1000));
+        assert_eq!(pacer.reserve(0), Duration::ZERO);
+        pacer.set_rate(Some(1_000_000));
+        assert_eq!(pacer.rate(), Some(1_000_000));
+        pacer.set_rate(None);
+        assert!(pacer.is_unlimited());
+        assert_eq!(pacer.reserve(1_000_000), Duration::ZERO);
     }
 
     #[test]
-    #[ignore = "KNOWN DEFECT: the pacing arithmetic in reserve lets a limited transfer exceed its ceiling. See the module header and .omp/TODO.md."]
+    fn a_rate_change_does_not_recompute_an_outstanding_reservation() {
+        // §9.1's fifth invariant, checked entirely through the public surface:
+        // what was reserved at the old rate keeps its place, because those
+        // intervals belong to callers that are already waiting for them.
+        let pacer = Pacer::new(Some(1_000)); // one millisecond per byte
+        let _outstanding = pacer.reserve(1_000_000); // a thousand seconds of it
+        pacer.set_rate(Some(1_000_000)); // a thousand times faster
+        let after = pacer.reserve(1_000_000);
+        // A megabyte at the new rate is a second of traffic, but it cannot jump
+        // the queue: it starts where the outstanding reservation ends.
+        assert!(after >= Duration::from_secs(900), "{after:?}");
+    }
+
+    #[test]
     fn concurrent_reservations_do_not_double_spend() {
-        // Ten callers each want a kilobyte at 1 kB/s. The bucket's burst covers
-        // only half a second, so after the first caller the rest must queue — and
-        // each must get its own place rather than all being handed the same
-        // number and then all proceeding at once.
-        let bucket = TokenBucket::new(Some(1_000));
-        let waits: Vec<Duration> = (0..10).map(|_| bucket.reserve(1_000)).collect();
-        // The burst serves the first claim outright.
+        // Ten callers each want a kilobyte at 1 kB/s. The initial deferral
+        // covers one second of that, so after the first caller the rest must
+        // queue — and each must get its own place rather than all being handed
+        // the same number and then all proceeding at once.
+        let pacer = Pacer::new(Some(1_000));
+        let waits: Vec<Duration> = (0..10).map(|_| pacer.reserve(1_000)).collect();
+        // The deferral serves the first claim outright.
         assert_eq!(waits[0], Duration::ZERO);
         // Everything after it had to wait.
         let queued: Vec<u128> = waits[1..].iter().map(Duration::as_nanos).collect();
         assert!(
             queued.iter().all(|nanos| *nanos > 0),
-            "every claim after the burst must pace: {waits:?}"
+            "every claim after the deferral must pace: {waits:?}"
         );
-        // ... and the timeline is what carries them: nine further kilobytes at
-        // 1 kB/s is nine seconds of backlog.
-        let mark = bucket.reserved_until.load(Ordering::Acquire);
+        // ... and the timeline is what carries them: ten further kilobytes at
+        // 1 kB/s is ten seconds of backlog.
+        let mark = pacer.reserved_until.load(Ordering::Acquire);
         assert!(mark >= 9_000_000_000, "mark was {mark}");
     }
 
     #[tokio::test]
-    #[ignore = "KNOWN DEFECT: the pacing arithmetic in reserve lets a limited transfer exceed its ceiling. See the module header and .omp/TODO.md."]
     async fn acquire_actually_waits() {
         // Small enough to finish quickly, large enough that "no wait" is wrong.
-        // The first call books the whole burst, so the second has to sleep.
-        let bucket = TokenBucket::new(Some(1_000_000)); // 1 us per byte
-        bucket.acquire(500_000).await;
+        // The first call spends the initial deferral, so the second has to
+        // sleep for the whole of its own interval.
+        let pacer = Pacer::new(Some(1_000_000)); // 1 us per byte
+        pacer.acquire(500_000).await;
         let start = Instant::now();
-        bucket.acquire(500_000).await;
+        pacer.acquire(500_000).await;
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50), "elapsed {elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "elapsed {elapsed:?}");

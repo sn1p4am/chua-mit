@@ -1,0 +1,22 @@
+[package]
+name = "chua-cli"
+description = "M1 verification host: drives the download engine from the command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "chua-cli"
+path = "src/main.rs"
+
+[dependencies]
+chua-engine.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

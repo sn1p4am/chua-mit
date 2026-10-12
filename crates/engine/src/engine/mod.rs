@@ -380,8 +380,14 @@ impl Actor {
                 TaskState::Downloading | TaskState::Probing | TaskState::Verifying => {
                     TaskState::Queued
                 }
-                // A task that never got past registration is re-queued too.
-                TaskState::Created => TaskState::Queued,
+                // A task that was killed between registration and the end of its
+                // probe never left `Created`, and the table has no direct edge
+                // from there to `Queued`. It comes back as `Probing`, which is
+                // both a legal edge and the honest description of what it was
+                // doing; the worker walks it on to `Queued` itself. Leaving it
+                // in `Created` would be worse than untidy — it is not a state a
+                // worker can be started from.
+                TaskState::Created => TaskState::Probing,
                 other => other,
             };
             if normalised != original {
@@ -402,6 +408,24 @@ impl Actor {
                 Arc::new(Mutex::new(transfer::ProgressBoard::new(&record.segments))),
             );
             self.records.insert(record.id, record);
+        }
+
+        // §7.3(1): non-terminal tasks are restored. Restoring the *record* is
+        // not the same as restarting the *work*, and a host that only wants to
+        // read state must not find itself transferring bytes, so the two are
+        // separated by `auto_resume` and the host decides which one it is
+        // asking for. `Paused` is deliberately excluded: §3.1 makes it
+        // persistent across restarts, and only an explicit resume may lift it.
+        if self.config.auto_resume {
+            let resumable: Vec<TaskId> = self
+                .records
+                .values()
+                .filter(|record| matches!(record.state, TaskState::Queued | TaskState::Probing))
+                .map(|record| record.id)
+                .collect();
+            for id in resumable {
+                self.start_worker(id);
+            }
         }
         Ok(())
     }
@@ -510,6 +534,12 @@ impl Actor {
             .map_err(|failure| EngineError::Unavailable(Box::new(failure)))?;
         self.records.insert(id, record.clone());
         self.emit(EngineEvent::task(EventKind::TaskAdded, self.view(&record)));
+
+        // Registration is immediately followed by the probe, and §3.2 has no
+        // `Created -> Queued` edge: the task has to be walked through `Probing`
+        // rather than teleported past it. Doing it here also means the state a
+        // crash during the probe leaves behind (`Probing`) is the truth.
+        self.apply_state(id, TaskState::Probing, None)?;
 
         let probe = match Self::probe_with_retry(&self.client, &self.config, &url).await {
             Ok(probe) => probe,

@@ -96,11 +96,20 @@ impl SegmentPolicy {
         count as u32
     }
 
-    /// Split `[0, total_len)` into `count` intervals that exactly tile it.
+    /// Split `[0, total_len)` into up to `count` intervals that exactly tile it.
     ///
     /// Boundaries are aligned to `granularity` except for the final segment,
     /// which always ends at `total_len - 1`. The result satisfies invariant I1:
     /// the union is the whole range and no two intervals overlap.
+    ///
+    /// A boundary is dropped when the segment it would create is below
+    /// `min_segment_bytes`: §6.1 makes that floor a MUST, because a segment
+    /// that small costs more to schedule than the parallelism it buys. Dropping
+    /// a boundary merges its bytes into the segment before it, so the requested
+    /// count is an upper bound rather than a promise. Alignment and the floor
+    /// pull in opposite directions on a file that is only a couple of granules
+    /// long, and the floor wins — one 4 MiB segment is a better answer than
+    /// four full-size ones plus a handful of one-byte slivers.
     pub fn plan(&self, total_len: u64, range_supported: bool) -> Vec<(u64, u64)> {
         if total_len == 0 {
             return Vec::new();
@@ -119,7 +128,17 @@ impl SegmentPolicy {
             let floor = boundaries[boundaries.len() - 1] + 1;
             let remaining = u64::from(count - index);
             let ceiling = total_len.saturating_sub(remaining);
-            boundaries.push(aligned.clamp(floor, ceiling.max(floor)));
+            let candidate = aligned.clamp(floor, ceiling.max(floor));
+            let previous = boundaries[boundaries.len() - 1];
+            // Both sides matter: a boundary too close to the one before it
+            // creates a sliver, and one too close to the end leaves a sliver
+            // behind it.
+            if candidate - previous < self.min_segment_bytes
+                || total_len - candidate < self.min_segment_bytes
+            {
+                continue;
+            }
+            boundaries.push(candidate);
         }
         boundaries.push(total_len);
         boundaries

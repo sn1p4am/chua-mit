@@ -101,3 +101,71 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
   因此 5 个配速用例被标为 `#[ignore]` 而不是删掉或放宽。
   **限速未实现**，`set_global_rate_limit` / 每任务 `--limit` 目前不生效。
   速率**测量**（`RateWindow`）与限速的**接线**（`pace`、`effective_limit`、运行中改速率）均已通过测试。
+
+> **以上为 M1 集成测试与 CLI 会话（`implement-m1-integration-and-cli`）之前的状态。**
+> 该会话已把配速重写为**单一时间线**（`Pacer`，一个 `reserved_until` 原子 + 每次预留一次
+> `compare_exchange`），5 个配速用例去掉 `#[ignore]` 后全部通过；限速经端到端实测生效
+> （4 MiB @ 2 MiB/s 用时约 2.05 s，此前 1.04 s 即 2 倍超发）。以下为本轮新发现的规格缺口。
+
+- **§3.2 的迁移表没有 `{Completed,Failed} → Removed`。** 表里只有「非终态 → Removed」，
+  照字面读则**已完成/已失败的任务永远无法删除**——而 `spec/cli-v1.md` §2 要求实现 `remove`，
+  且用户要清理的恰恰是这些任务。实现按「§3.1 的『终态 MUST NOT 自动离开』约束的是自动迁移，
+  宿主显式指令不算」处理，补了 `{Completed,Failed} → Removed` 两条边（与表中已有的
+  `Failed → Probing` 显式重试同形）。代码位置：`crates/engine/src/state.rs::can_transition_to`。
+  请确认这两条边是否应写进 §3.2。
+
+- **§4.3 未说明未知长度模式如何判定「传完了」，也未说明 `total_len` 之后取什么值。**
+  实现采用：关闭连接即是表示结束（收到 EOF 即该段完成），并把实际收到的字节数作为
+  `total_len` 记入任务（属于 §4.3 允许的「来源在中途给出了长度」）。此前实现把 EOF 一律
+  当作「响应被截断」，未知长度模式**永远无法完成**。请规格侧确认这一读法。
+
+- **§9.1 不变式 2（SHOULD ≤ N/rate + 一个分块）与不变式 5（改速率不追溯）会冲突。**
+  不改速率时两者相容；运行中把速率调高时，「不追溯」要求已经发出的预留区间保持不变，
+  于是新预留会排在按**旧**速率记下的欠账之后（过慢），而「不超发」不允许反过来缩短欠账。
+  实现按 MUST 优先：不动已发出的区间，只改之后预留的单价，并把过慢上界限定在
+  「每条传输通道一个分块」的量级。代码位置：`crates/engine/src/engine/throttle.rs::set_rate`。
+
+- **§7.3(1)/§3.2 没写「谁把恢复出来的任务重新跑起来」。** `EngineConfig::auto_resume`
+  字段存在但此前未被任何代码读取：`restore()` 把非终态任务归一化到 `Queued` 之后就停住了，
+  而 `Queued → Queued` 不是合法迁移，宿主没有任何公开接口能让它重新开始。
+  实现为：`restore()` 在 `auto_resume` 为真时对 `Queued`/`Probing` 任务启动 worker；
+  由宿主按命令决定（只读命令不启动传输，`resume` 才启动）。另把 `Created` 的归一化目标
+  从 `Queued` 改为 `Probing`——`Created → Queued` 不在迁移表里，原实现会**静默丢弃**
+  在探测期间被中断的任务。代码位置：`crates/engine/src/engine/mod.rs::restore`。
+
+- **`spec/engine-v1.md` §6.1 的「单段 MUST NOT 小于一个下限」与对齐规则相冲。**
+  默认策略下 8 MiB 文件会切出 3 个 1 字节段（对齐到 4 MiB 粒度后落回上一条边界），
+  即段大小低于 1 MiB 下限。实现改为：候选边界若会产生低于下限的段（含末尾段）就丢弃，
+  其字节并入前一段。请确认该读法，并考虑 `granularity` 与 `min_segment_bytes` 是否应
+  在配置校验里约束相互关系。
+
+- **`spec/cli-v1.md` §2 的 `--detach` 在「一次调用即退出的宿主」里没有意义。**
+  「登记任务后立即返回」之后，本进程已退出，没有任何东西在驱动传输。当前实现照字面做
+  （登记即返回 0），并在输出里提示需要再执行 `resume --all` 才能继续。
+  如果规格希望 `--detach` 代表「后台继续下载」，需要指定一种常驻机制（M5 的常驻宿主天然满足）。
+
+- **`spec/cli-v1.md` §4 与验收套件对输出的编码要求不一致。** `spec/acceptance/run.py`
+  用 `subprocess.run(text=True)` 捕获子进程输出，按**平台本地编码**解码（本机为 GBK）；
+  而 `spec/engine-v1.md` §8.4 要求宿主给出**中文**说明。CLI 若输出 UTF-8 中文，
+  套件会在 `UnicodeDecodeError` 上直接崩溃（实测如此，非推测）。
+  实现选择：CLI 的输出**全部为 ASCII 英文**，中文文案留给 M5 的 GUI 宿主。
+  若规格希望 CLI 也输出中文，需要同时指定输出编码与套件的解码方式。
+
+- **`spec/cli-v1.md` 没有给「引擎拒绝状态迁移」留退出码。** 例如 `pause` 一个已完成任务、
+  或 `remove` 一个已被删除的任务。实现的读法是：这属于「任务失败」→ 退出码 2
+  （用法错误 1 留给参数本身不合法的情况）。请确认，或补一个码。
+
+- **`spec/cli-v1.md` 未规定多个宿主进程共享同一状态目录时的语义。**
+  本 CLI 每次调用都是一个独立进程：`list`/`status` 可以在下载中调用（实测 12/12 次成功、
+  无 SQLite 锁冲突），但 `pause`/`remove` 由另一个进程发出时，**无法打断**正在传输的那个进程，
+  且其后一条状态上报会覆盖掉刚写入的 `Paused`。ADR-0004 的单 actor 模型隐含「一个状态目录
+  一个宿主进程」；验收套件不覆盖这一情形。建议在规格里写明该约束（M5 常驻宿主天然满足）。
+
+- **供规格侧参考（不是缺口）：验收套件的 `resume-after-kill` 证据比自己以为的弱。**
+  §6.4 要求预分配目标文件，因此 `run.py` 等 `dest.stat().st_size > PAYLOAD_SIZE // 8` 时，
+  文件**一开始就是全尺寸**，`kill` 几乎立刻发生，`partial` 打印出来等于全尺寸。
+  该项通过说明「重启后最终字节正确」，但并不能证明「已落盘字节没有被重下」。
+  真正的续传证据在 `crates/engine/tests/http_end_to_end.rs` 的
+  `an_interrupted_download_resumes_and_the_final_bytes_are_correct`：它按服务端实际发出的
+  字节数断言续传没有重下整份文件。若要让套件自己也具备这个力度，需要把判据从
+  「文件大小」换成「服务端已发送字节数」（`/_requests` 目前只报请求数，不报字节数）。
