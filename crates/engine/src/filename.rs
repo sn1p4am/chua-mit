@@ -274,20 +274,34 @@ fn latin1_to_string(value: &str) -> String {
 ///
 /// Rules, all of them mandatory:
 /// * percent-decoding happens first, so `%2e%2e` cannot smuggle `..` past it;
-/// * path separators (`/`, `\`) are removed — a candidate can never introduce a
-///   directory component;
+/// * a candidate containing a path is reduced to its **last non-empty segment**
+///   — `spec/engine-v1.md` §4.2 (v1.0.1) makes this a MUST: separators are not
+///   removed and the pieces joined, because joining yields a name the user never
+///   asked for and leaves the remains of `..` sitting inside it;
 /// * C0 and C1 control characters and the DEL character are removed;
 /// * characters that are illegal in Windows path components are replaced;
 /// * trailing dots and spaces are removed;
-/// * `.` and `..` are rejected outright;
+/// * a leading-dot name is stripped, since it would be hidden on POSIX;
 /// * Windows device names are prefixed so they stop being device names;
 /// * the result is truncated on a character boundary.
 pub fn sanitize(candidate: &str) -> Sanitized {
     let decoded = decode_percent(candidate);
-    let mut cleaned = String::with_capacity(decoded.len());
     let mut reason: Option<NameRejection> = None;
 
-    for ch in decoded.chars() {
+    // §4.2: take the last non-empty segment before anything else. A candidate
+    // that is nothing but separators has no segment at all and falls back.
+    let segment = match decoded.rsplit(['/', '\\']).find(|part| !part.is_empty()) {
+        Some(segment) => {
+            if segment.len() != decoded.len() {
+                reason = Some(NameRejection::SeparatorsRemoved);
+            }
+            segment
+        }
+        None => return Sanitized::Fallback(SafeName(FALLBACK_STEM.to_string())),
+    };
+
+    let mut cleaned = String::with_capacity(segment.len());
+    for ch in segment.chars() {
         if ch == '/' || ch == '\\' {
             reason = Some(NameRejection::SeparatorsRemoved);
             continue;
@@ -311,7 +325,7 @@ pub fn sanitize(candidate: &str) -> Sanitized {
     }
     cleaned.truncate(trimmed_len);
 
-    // Leading dots would produce a hidden file on POSIX platforms, and a name
+    // A leading dot would produce a hidden file on POSIX platforms, and a name
     // of nothing but dots is a directory reference whatever the platform.
     if cleaned.starts_with('.') {
         reason = Some(NameRejection::IllegalCharacters);
@@ -381,28 +395,46 @@ mod tests {
     #[test]
     fn plain_name_is_accepted_untouched() {
         let outcome = sanitize("archive-v1.tar.gz");
-        assert_eq!(outcome, Sanitized::Acceptable(SafeName("archive-v1.tar.gz".into())));
+        assert_eq!(
+            outcome,
+            Sanitized::Acceptable(SafeName("archive-v1.tar.gz".into()))
+        );
         assert!(!outcome.was_rewritten());
     }
 
     #[test]
     fn parent_directory_escape_is_neutralised() {
-        // Both the literal and the percent-encoded forms.
+        // §4.2 (v1.0.1): a candidate containing a path is reduced to its last
+        // non-empty segment, so a traversal collapses to a plain filename and
+        // the `..` disappears entirely.
         assert_eq!(name_of(".."), "download");
         assert_eq!(name_of("%2e%2e"), "download");
         assert_eq!(name_of("."), "download");
-        assert_eq!(name_of("../etc/passwd"), "etc_passwd");
-        assert_eq!(name_of("..\\..\\windows\\system32"), "windows_system32");
+        assert_eq!(name_of("../etc/passwd"), "passwd");
+        assert_eq!(name_of("..\\..\\windows\\system32"), "system32");
+        assert_eq!(name_of("....//....//etc/shadow"), "shadow");
+        assert_eq!(name_of("/etc/passwd"), "passwd");
+        assert_eq!(name_of("a/b/c.zip"), "c.zip");
+        assert_eq!(name_of("..\\..\\x.txt"), "x.txt");
     }
 
     #[test]
     fn path_separators_never_survive() {
-        for input in ["a/b", "a\\b", "/etc/shadow", "C:\\Windows\\notepad.exe"] {
+        for input in [
+            "a/b",
+            "a\\b",
+            "/etc/shadow",
+            "C:\\Windows\\notepad.exe",
+            "//host/share/file.bin",
+            "trailing/",
+        ] {
             let name = name_of(input);
             assert!(!name.contains('/'), "{input} -> {name}");
             assert!(!name.contains('\\'), "{input} -> {name}");
+            assert!(!name.is_empty(), "{input} produced an empty name");
         }
-        assert_eq!(name_of("a/b"), "ab");
+        assert_eq!(name_of("a/b"), "b");
+        assert_eq!(name_of("trailing/"), "trailing");
     }
 
     #[test]
@@ -446,9 +478,11 @@ mod tests {
     fn percent_encoding_is_decoded_before_sanitising() {
         assert_eq!(name_of("my%20file.zip"), "my file.zip");
         assert_eq!(name_of("%E6%96%87%E4%BB%B6.zip"), "文件.zip");
-        // Encoded separator: decoded, then removed.
-        assert_eq!(name_of("a%2Fb"), "ab");
+        // An encoded separator is decoded first and then treated as a real
+        // separator, so the last-segment rule applies to it as well.
+        assert_eq!(name_of("a%2Fb"), "b");
         assert_eq!(name_of("%2F%2F%2F"), "download");
+        assert_eq!(name_of("%2e%2e%2Fpasswd"), "passwd");
     }
 
     #[test]
@@ -497,7 +531,9 @@ mod tests {
             Some("文件.zip".to_string())
         );
         assert_eq!(
-            parse_content_disposition("attachment; filename=\"fallback.zip\"; filename*=utf-8''real%20name.zip"),
+            parse_content_disposition(
+                "attachment; filename=\"fallback.zip\"; filename*=utf-8''real%20name.zip"
+            ),
             Some("real name.zip".to_string())
         );
     }
@@ -522,7 +558,7 @@ mod tests {
             final_url: &url("https://example.test/x"),
             host_hint: None,
         });
-        assert_eq!(derived.into_name().into_string(), "etc_passwd");
+        assert_eq!(derived.into_name().into_string(), "passwd");
         // Header that carries no filename falls through to the URL.
         let derived = derive(&NameSources {
             content_disposition: Some("attachment"),
@@ -534,16 +570,25 @@ mod tests {
 
     #[test]
     fn mixed_encoding_names() {
-        // Encoded CJK plus a literal space plus an encoded separator.
-        assert_eq!(name_of("%E6%96%87%E4%BB%B6 %2Fname.zip"), "文件 name.zip");
-        // Half-encoded traversal.
+        // Decoding happens before the last-segment decision, so an encoded CJK
+        // run and an encoded separator are both resolved first.
+        assert_eq!(name_of("%E6%96%87%E4%BB%B6%2Fname.zip"), "name.zip");
+        assert_eq!(name_of("%E6%96%87%E4%BB%B6.zip"), "文件.zip");
+        assert_eq!(name_of("%E6%96%87%E4%BB%B6 %2Fname.zip"), "name.zip");
+        // Half-encoded traversal collapses to the last segment too.
         assert_eq!(name_of("..%2F..%2Fboot.ini"), "boot.ini");
         // RFC 5987 payload that is itself double-encoded.
         assert_eq!(
             parse_content_disposition("attachment; filename*=UTF-8''%252Fetc"),
             Some("%2Fetc".to_string())
         );
-        assert_eq!(name_of(&parse_content_disposition("attachment; filename*=UTF-8''%252Fetc").unwrap()), "etc");
+        assert_eq!(
+            name_of(
+                &parse_content_disposition("attachment; filename*=UTF-8''%252Fetc")
+                    .unwrap_or_default()
+            ),
+            "etc"
+        );
     }
 
     #[test]

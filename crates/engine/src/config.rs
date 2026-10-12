@@ -40,7 +40,11 @@ impl Default for SegmentPolicy {
     fn default() -> Self {
         Self {
             max_segments: 8,
-            granularity: MIN_SEGMENT_BYTES,
+            // §11's suggested granularity. It is deliberately larger than the
+            // hard floor below: the floor is the point at which a segment stops
+            // being worth scheduling, while the granularity is the alignment
+            // that keeps a split from leaving a large remainder.
+            granularity: SINGLE_SEGMENT_UP_TO,
             single_segment_up_to: SINGLE_SEGMENT_UP_TO,
             min_segment_bytes: MIN_SEGMENT_BYTES,
         }
@@ -287,7 +291,10 @@ mod tests {
             vec![(0, SINGLE_SEGMENT_UP_TO - 1)]
         );
         // Without range support the count is one whatever the size.
-        assert_eq!(policy.plan(100 * 1024 * 1024, false), vec![(0, 100 * 1024 * 1024 - 1)]);
+        assert_eq!(
+            policy.plan(100 * 1024 * 1024, false),
+            vec![(0, 100 * 1024 * 1024 - 1)]
+        );
     }
 
     #[test]

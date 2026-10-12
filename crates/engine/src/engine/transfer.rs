@@ -143,7 +143,9 @@ impl ProgressBoard {
         let absolute = capped - segment.start + 1;
         if absolute > durable + current {
             self.pending[index] = absolute - durable;
-            self.total_received = self.total_received.saturating_add(absolute - durable - current);
+            self.total_received = self
+                .total_received
+                .saturating_add(absolute - durable - current);
         }
     }
 
@@ -295,7 +297,8 @@ pub async fn open_validated_body(
 /// with the progress board, and the store is told about it by the caller.
 pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> SegmentOutcome {
     let id = plan.id;
-    let (mut response, mut offset, mut remaining) = match open_validated_body(context, &plan).await {
+    let (mut response, mut offset, mut remaining) = match open_validated_body(context, &plan).await
+    {
         Ok(triple) => triple,
         Err(failure) => return SegmentOutcome::Rejected { id, failure },
     };
@@ -352,15 +355,16 @@ pub async fn fetch_segment(context: &TransferContext, plan: SegmentPlan) -> Segm
         }
 
         // Pace before writing, so the ceiling applies to what leaves the socket
-        // rather than to what has already been buffered.
+        // rather than to what has already been buffered. The stop signal races
+        // the wait so that a pause during a long pacing sleep takes effect
+        // promptly rather than after it completes.
         let global = context.global_limiter.clone();
         let task = context.task_limiter.clone();
-        let paced = tokio::select! {
+        tokio::select! {
             biased;
             () = wait_for_stop(&context.stop) => return SegmentOutcome::Stopped { id },
-            () = pace(global.as_ref(), task.as_ref(), length) => (),
-        };
-        paced;
+            () = pace(global.as_ref(), task.as_ref(), length) => {}
+        }
         if let Err(failure) = write_chunk(context, id, offset, &chunk) {
             return SegmentOutcome::Rejected { id, failure };
         }
@@ -635,7 +639,9 @@ mod tests {
 
     #[test]
     fn progress_board_ignores_repeated_and_rewound_reports() {
-        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(0, 0, 99)])));
+        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(
+            0, 0, 99,
+        )])));
         {
             let mut guard = board.lock().unwrap();
             guard.extend(0, 19);
@@ -649,7 +655,9 @@ mod tests {
 
     #[test]
     fn progress_board_never_runs_past_the_interval() {
-        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(0, 10, 19)])));
+        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(
+            0, 10, 19,
+        )])));
         {
             let mut guard = board.lock().unwrap();
             guard.extend(0, 1_000_000);
@@ -708,7 +716,9 @@ mod tests {
 
     #[test]
     fn a_report_for_an_unknown_segment_is_dropped_not_attributed() {
-        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(0, 0, 99)])));
+        let board = Arc::new(Mutex::new(ProgressBoard::new(&[SegmentState::new(
+            0, 0, 99,
+        )])));
         {
             let mut guard = board.lock().unwrap();
             guard.extend(42, 50);

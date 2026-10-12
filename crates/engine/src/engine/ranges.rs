@@ -56,8 +56,24 @@ impl RangeRequest {
     }
 
     /// Bytes requested.
+    ///
+    /// A request with `end == u64::MAX` is the open-ended `bytes=N-` form, which
+    /// asks for "the rest of the representation". Its size is not knowable from
+    /// the request alone, so it reports [`u64::MAX`]. Every branch uses
+    /// saturating arithmetic: an interval with `end == u64::MAX` is legal and
+    /// must not wrap.
     pub const fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start) + 1
+        if self.end == u64::MAX {
+            return u64::MAX;
+        }
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+
+    /// Whether the request covers no bytes. Always false for a well-formed
+    /// interval, but present so that [`RangeRequest::len`] has its conventional
+    /// partner.
+    pub const fn is_empty(&self) -> bool {
+        self.end < self.start
     }
 
     /// Whether this request covers `[0, total)` and therefore may legitimately
@@ -157,7 +173,8 @@ pub fn validate_range_response(
                         detail: format!("partial_end_{}_expected_{}", range.end, request.end),
                     };
                 }
-                if let (Some(reported), Some(expected)) = (range.complete_len, request.expected_total)
+                if let (Some(reported), Some(expected)) =
+                    (range.complete_len, request.expected_total)
                     && reported != expected
                 {
                     return RangeVerdict::RangeMismatch {
@@ -202,16 +219,20 @@ pub fn verdict_failure(verdict: &RangeVerdict, scope: FailureScope) -> Option<Fa
             )
             .not_retryable(),
         ),
-        RangeVerdict::RangeMismatch { detail } => Some(
-            Failure::new(FailureKind::DataMismatch, scope, detail.clone()).not_retryable(),
-        ),
+        RangeVerdict::RangeMismatch { detail } => {
+            Some(Failure::new(FailureKind::DataMismatch, scope, detail.clone()).not_retryable())
+        }
         RangeVerdict::StatusRejected { status } => {
-            let code = u16::try_from(*status).unwrap_or(u16::MAX);
+            let code = *status;
             reqwest::StatusCode::from_u16(code)
                 .ok()
                 .and_then(|status| crate::http::status_failure(status, &Default::default(), scope))
                 .or_else(|| {
-                    Some(Failure::new(FailureKind::Unknown, scope, format!("http_{code}")))
+                    Some(Failure::new(
+                        FailureKind::Unknown,
+                        scope,
+                        format!("http_{code}"),
+                    ))
                 })
         }
     }
@@ -246,7 +267,8 @@ mod tests {
     #[test]
     fn matching_partial_response_is_accepted() {
         let request = RangeRequest::segment(1024, 2047, 8192);
-        let verdict = validate_range_response(&request, 206, Some(cr(1024, 2047, Some(8192))), Some(1024));
+        let verdict =
+            validate_range_response(&request, 206, Some(cr(1024, 2047, Some(8192))), Some(1024));
         assert_eq!(verdict, RangeVerdict::Accept);
         assert!(verdict.is_writable());
         assert_eq!(verdict.write_offset(&request), Some(1024));
@@ -316,7 +338,8 @@ mod tests {
     fn partial_responses_with_the_wrong_interval_are_rejected() {
         let request = RangeRequest::segment(0, 1023, 4096);
         // The server sent the whole file as a 206 (some do).
-        let verdict = validate_range_response(&request, 206, Some(cr(0, 4095, Some(4096))), Some(4096));
+        let verdict =
+            validate_range_response(&request, 206, Some(cr(0, 4095, Some(4096))), Some(4096));
         assert_eq!(
             verdict,
             RangeVerdict::RangeMismatch {
@@ -327,7 +350,8 @@ mod tests {
 
         // Off-by-one start.
         let request = RangeRequest::segment(1024, 2047, 4096);
-        let verdict = validate_range_response(&request, 206, Some(cr(1023, 2047, Some(4096))), Some(1025));
+        let verdict =
+            validate_range_response(&request, 206, Some(cr(1023, 2047, Some(4096))), Some(1025));
         assert_eq!(
             verdict,
             RangeVerdict::RangeMismatch {
@@ -352,7 +376,8 @@ mod tests {
     #[test]
     fn a_changed_total_is_rejected() {
         let request = RangeRequest::segment(0, 99, 1000);
-        let verdict = validate_range_response(&request, 206, Some(cr(0, 99, Some(2000))), Some(100));
+        let verdict =
+            validate_range_response(&request, 206, Some(cr(0, 99, Some(2000))), Some(100));
         assert_eq!(
             verdict,
             RangeVerdict::RangeMismatch {

@@ -250,8 +250,9 @@ impl BackoffPolicy {
             .saturating_mul(1u32 << (attempt - 1).min(16))
             .min(self.max_delay);
         let base = match retry_after {
-            // A throttling response wins over our own curve (§8.3).
-            Some(server) => server.min(self.max_delay),
+            // A throttling response wins over our own curve (§8.3), but only
+            // within the interval ceiling the policy sets.
+            Some(server) => server.clamp(self.initial, self.max_delay),
             None => exponential,
         };
         let spread = base.mul_f64(self.jitter_ratio.clamp(0.0, 1.0));
@@ -331,16 +332,26 @@ mod tests {
 
     #[test]
     fn throttling_delay_overrides_the_curve() {
-        let policy = BackoffPolicy::default();
+        // Jitter off, so the comparison is exact rather than a band.
+        let policy = BackoffPolicy {
+            jitter_ratio: 0.0,
+            ..BackoffPolicy::default()
+        };
+        // Seven seconds is inside the policy's band, so the server's number wins
+        // outright.
         let server = Some(Duration::from_secs(7));
-        let delay = policy.next_delay(1, server, 0.0).unwrap();
-        assert_eq!(delay, Duration::from_secs(7));
-        // ... and is still capped.
-        let huge = Some(Duration::from_secs(600));
         assert_eq!(
-            policy.next_delay(1, huge, 0.0).unwrap(),
-            policy.max_delay
+            policy.next_delay(1, server, 0.0).unwrap(),
+            Duration::from_secs(7)
         );
+        // Beyond the ceiling, the ceiling applies: §8.3 requires the maximum
+        // interval to be bounded whatever the server asks for.
+        let huge = Some(Duration::from_secs(600));
+        assert_eq!(policy.next_delay(1, huge, 0.0).unwrap(), policy.max_delay);
+        // Below the floor, the floor applies, so a hostile `Retry-After: 0`
+        // cannot turn into a retry storm.
+        let zero = Some(Duration::ZERO);
+        assert_eq!(policy.next_delay(1, zero, 0.0).unwrap(), policy.initial);
     }
 
     #[test]

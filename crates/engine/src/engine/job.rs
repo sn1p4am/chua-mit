@@ -101,9 +101,12 @@ impl JobControl {
         match (existing, bytes_per_second) {
             (Some(limiter), Some(rate)) => limiter.set_rate(Some(rate)),
             (Some(limiter), None) => limiter.set_rate(None),
-            (None, Some(rate)) => self.task_limit.set(Some(
-                crate::engine::throttle::RateLimiter::shared(Some(rate)),
-            )),
+            (None, Some(rate)) => {
+                self.task_limit
+                    .set(Some(crate::engine::throttle::RateLimiter::shared(Some(
+                        rate,
+                    ))))
+            }
             (None, None) => {}
         }
     }
@@ -198,7 +201,7 @@ pub struct WorkerContext {
     /// Concurrency slots, shared across all tasks.
     pub permits: Arc<Semaphore>,
     /// Where reports go.
-    pub reports: mpsc::Sender<Command>,
+    pub(crate) reports: mpsc::Sender<Command>,
     /// Phase control from the actor.
     pub control: JobControlReceiver,
     /// Sliding-window rate estimate.
@@ -218,7 +221,11 @@ impl WorkerContext {
             task: self.id,
             kind,
         };
-        if self.reports.try_send(Command::Report(Box::new(report))).is_err() {
+        if self
+            .reports
+            .try_send(Command::Report(Box::new(report)))
+            .is_err()
+        {
             // The actor's inbox is full or closed. Dropping a report is safe for
             // `Progress` (the next one supersedes it) and for `Done` (the actor
             // notices the closed channel), and a state report is retried by the
@@ -454,11 +461,22 @@ fn layout_for(context: &WorkerContext, use_ranges: bool) -> Vec<SegmentState> {
     layout
 }
 
-/// Open or create the target and make it exactly as large as the plan needs.
+/// Prepare the destination file for the transfer.
 ///
-/// §7.3(4)/(5): pre-existing content is never trusted blindly and never
-/// overwritten without a decision. Anything past the durable record is dropped,
-/// because those bytes cannot be assigned to an interval.
+/// Two invariants meet here and they pull in opposite directions:
+///
+/// * §I3 — the engine must not delete or truncate user-visible data without an
+///   explicit instruction;
+/// * §7.3(5) — when the segment record and the file disagree, be conservative:
+///   truncate to the confirmed byte count and re-fetch the rest.
+///
+/// The two are reconciled by resolving the conflict *before* this runs: a path
+/// that already exists is reported to the host (§7.4) and the task never reaches
+/// the transfer. So by the time this is called, any file present is one this
+/// task created on a previous attempt, and the conservative truncation of
+/// §7.3(5) applies to it. A file longer than the durable record is the residual
+/// case of a crash between a write and its commit: the extra bytes cannot be
+/// attributed to an interval, so they are dropped rather than trusted.
 fn prepare_target(
     path: &std::path::Path,
     total_len: Option<u64>,
@@ -482,24 +500,21 @@ fn prepare_target(
         .map_err(|error| crate::http::classify_io(&error, "open_target"))?;
 
     let mut truncated_extra = false;
+    let mut confirmed = durable_len;
     if let Some(len) = existing_len {
         if len > durable_len {
-            // Keep only bytes that belong to a durable interval; re-fetch the
-            // rest rather than guessing where the file stopped.
             file.set_len(durable_len)
                 .map_err(|error| crate::http::classify_io(&error, "truncate_target"))?;
             truncated_extra = true;
         } else if len < durable_len {
-            // The store claims more than the file holds. Trust the smaller of
-            // the two: truncation to the confirmed count is what §7.3(5) asks
-            // for, and the store is corrected by the next report.
-            return Ok(PreparedTarget {
-                durable_len: len,
-                truncated_extra: false,
-            });
+            // The store claims more than the file holds. The smaller of the two
+            // is the trustworthy figure, and the next progress report corrects
+            // the store.
+            confirmed = len;
         }
     }
 
+    // Preallocate so the whole range can be written at any offset (§6.4).
     if let Some(total) = total_len {
         let current = file
             .metadata()
@@ -512,7 +527,7 @@ fn prepare_target(
     }
 
     Ok(PreparedTarget {
-        durable_len,
+        durable_len: confirmed,
         truncated_extra,
     })
 }
@@ -654,19 +669,16 @@ async fn transfer_loop(
             LayoutOutcome::Stopped => return StepOutcome::Restart(TaskState::Queued),
             LayoutOutcome::Rejected { failure } => {
                 if failure.kind != FailureKind::DataMismatch {
-                    if failure.retryable {
-                        match context
-                            .config
-                            .backoff
-                            .next_delay(attempt, failure.retry_after, jitter_sample(&context.record.source_label, attempt))
-                        {
-                            Some(delay) => {
-                                tokio::time::sleep(delay).await;
-                                attempt = attempt.saturating_add(1);
-                                continue;
-                            }
-                            None => {}
-                        }
+                    if failure.retryable
+                        && let Some(delay) = context.config.backoff.next_delay(
+                            attempt,
+                            failure.retry_after,
+                            jitter_sample(&context.record.source_label, attempt),
+                        )
+                    {
+                        tokio::time::sleep(delay).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
                     }
                     context.fail(current, failure);
                     return StepOutcome::Failed;
@@ -686,7 +698,8 @@ async fn transfer_loop(
                             || fresh.total_len.is_none()
                             || fresh.total_len != context.record.total_len;
                         context.record.range_supported = fresh.range_supported;
-                        if let (Some(known), Some(again)) = (context.record.total_len, fresh.total_len)
+                        if let (Some(known), Some(again)) =
+                            (context.record.total_len, fresh.total_len)
                             && known != again
                         {
                             let mismatch = Failure::new(
@@ -707,8 +720,11 @@ async fn transfer_loop(
                                 context.fail(current, error);
                                 return StepOutcome::Failed;
                             }
-                            context.record.segments =
-                                layout_for(context, context.record.range_supported && context.record.total_len.is_some());
+                            context.record.segments = layout_for(
+                                context,
+                                context.record.range_supported
+                                    && context.record.total_len.is_some(),
+                            );
                             context.report(JobReportKind::Segments {
                                 segments: context.record.segments.clone(),
                             });
@@ -735,7 +751,12 @@ async fn transfer_loop(
             }
         }
 
-        if !context.record.segments.iter().all(SegmentState::is_complete) {
+        if !context
+            .record
+            .segments
+            .iter()
+            .all(SegmentState::is_complete)
+        {
             // The pass claims to be finished but a segment is incomplete: the
             // layout was re-planned underneath it. Re-plan and go round again.
             let refreshed = layout_for(
@@ -971,17 +992,35 @@ mod tests {
     }
 
     #[test]
-    fn prepare_target_drops_bytes_that_no_interval_claims() {
+    fn prepare_target_truncates_to_the_confirmed_count() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("target.bin");
         std::fs::write(&path, vec![0xAAu8; 4096]).unwrap();
         let mut segment = SegmentState::new(0, 0, 1023);
         segment.mark_durable_through(511);
         let prepared = prepare_target(&path, Some(1024), &[segment]).unwrap();
+        // The 3.5 KiB past the durable watermark is dropped, because no interval
+        // can claim it (§7.3(5)); it will be fetched again.
         assert!(prepared.truncated_extra);
         assert_eq!(prepared.durable_len, 512);
-        // Truncated to the confirmed count, not to the file's old length.
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
+        // ... and then the preallocation extends the file to the full length so
+        // that any segment can be written at any offset (§6.4).
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn prepare_target_extends_an_exactly_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.bin");
+        std::fs::write(&path, vec![0xAAu8; 512]).unwrap();
+        let mut segment = SegmentState::new(0, 0, 1023);
+        segment.mark_durable_through(511);
+        let prepared = prepare_target(&path, Some(1024), &[segment]).unwrap();
+        // File and store agree exactly, so nothing is dropped and the
+        // preallocation simply extends to the full length.
+        assert!(!prepared.truncated_extra);
+        assert_eq!(prepared.durable_len, 512);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024);
     }
 
     #[test]
@@ -1039,17 +1078,24 @@ mod tests {
         let limiter = control.task_limit().unwrap();
         assert_eq!(limiter.rate(), Some(1024));
         control.set_task_limit(Some(2048));
+        // The limiter object is reconfigured in place, so a transfer already
+        // holding a clone sees the new ceiling (§9.1). The last requested rate
+        // is remembered even while pacing is switched off.
         assert_eq!(control.task_limit().unwrap().rate(), Some(2048));
         control.set_task_limit(None);
-        // The limiter is reconfigured in place rather than dropped, so a live
-        // transfer sees the change (§9.1).
-        assert_eq!(limiter.rate(), None);
+        assert!(control.task_limit().unwrap().is_unlimited());
+        assert_eq!(control.task_limit().unwrap().rate(), Some(2048));
+        control.set_task_limit(Some(4096));
+        assert_eq!(control.task_limit().unwrap().rate(), Some(4096));
+        assert!(!control.task_limit().unwrap().is_unlimited());
     }
 
     #[test]
     fn limit_slot_is_shared_between_threads() {
         let slot = Arc::new(LimitSlot::default());
-        slot.set(Some(crate::engine::throttle::RateLimiter::shared(Some(100))));
+        slot.set(Some(crate::engine::throttle::RateLimiter::shared(Some(
+            100,
+        ))));
         let clone = Arc::clone(&slot);
         assert_eq!(clone.get().unwrap().rate(), Some(100));
     }

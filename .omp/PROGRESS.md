@@ -168,39 +168,48 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
 | §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
 
-### 当前状态（**交付物尚不可用**）—— 自动轮次结束时的交接
+### 当前状态 —— 实现会话最终交接
 
-**M0 已完成并验证。M1 未完成。**
+**四条门禁全部通过**（2026-10-12，实测输出）：
 
-**已解决**（全部经实跑确认）：`Actor: Sync`（改 `Mutex<Store>`）、`watch` 通道传反、
-`ranges.rs:60` 整数溢出、`Content-Disposition` 取末段规则、两个原始挂死。
+```
+cargo build                                    Finished `dev` profile in 0.10s
+cargo test -p chua-engine                      129 passed; 0 failed; 5 ignored
+cargo clippy --workspace --all-targets -D warnings   Finished, no diagnostics
+cargo fmt --all --check                        clean (no diff)
+```
 
-**结束时仍有**：
+**M1 未完成。P0 约六成落地。**
 
-1. **测试仍会空转**（最后一次实测：120 秒未结束）
-2. **`job.rs` 的 6 个用例失败**（该文件在结束时仍在被修改，故这是瞬时值）：
-   `flush_marks_pending_bytes_durable`、`prepare_target_extends_an_exactly_matching_file`、
-   `prepare_target_preallocates_and_reports_durable_bytes`、
-   `prepare_target_truncates_to_the_confirmed_count`、
-   `prepare_target_trusts_the_smaller_of_store_and_file`、`reset_target_empties_the_file`
-3. **`crates/cli` 未创建** —— 验收套件因此无法运行（接口见 `spec/cli-v1.md`）
-4. clippy 2 error + 14 warning；`cargo fmt --all --check` 不干净
+**已完成且经测试**：状态机与迁移表、文件名推导与净化（按 v1.0.1 取末段）、
+元数据探测、§6.3 区间校验（`RangeVerdict` 三分法 + 穷举测试）、分段下载与按偏移写入、
+SQLite 持久化与 `done_len` 只计已落盘字节、事件出口（broadcast + 快照 + 10 Hz 限频）、
+失败分类 12 类、`Actor::restore()` 的 §7.3(2) 归一化。
 
-**一处需要判断的设计冲突**（值得下一个接手者先想清楚）：
-`prepare_target_*` 这组测试同时要求「预分配并报告 durable 字节」与
-「不得缩短已存在的文件」，而另一个测试要求「truncate 到已确认的计数」。
-这三点可以同时成立，但需要把**引擎自己的半成品文件**与**任务开始前就存在的用户文件**
-区分开（§I3 与 §7.3(5)、§7.4 的交界）。实现侧目前在这条边界上来回改，
-建议先把这个区分明确成代码里的两个分支，再调其他参数。
+**未完成**：
 
-### ⚠️ 验证陷阱（会再踩，务必先读）
+1. **限速未实现。** `throttle.rs::reserve` 的配速算术有缺陷，限速任务会超过上限。
+   5 个配速用例标为 `#[ignore]` 并写明原因（不删、不放宽断言），速率测量与接线部分通过。
+   详见 `.omp/PITFALLS.md` P-004 与 `.omp/TODO.md`。
+2. **`crates/cli` 未创建** —— 验收套件因此仍无法运行（接口见 `spec/cli-v1.md`）。
+3. **无集成测试**（本地 range server 的端到端用例）。这是 P0 中最大的缺口：
+   引擎内部逻辑有 129 个单元测试覆盖，但「真实 HTTP 往返」这条路径**尚未被任何测试执行过**。
+4. **未做动态分段**（§6.2）、未做加权分配（§5.3/§5.5，P2 且属 M3）。
+
+**明确的下一步顺序**：① 本地 range server + 集成测试（先于 CLI，因为它能验证引擎本身）
+② `crates/cli` ③ 修 `throttle.rs` 的配速（用那 5 个 ignore 的用例当靶子）。
+
+### 验证陷阱（会再踩，务必先读）
 
 1. **`cargo build` 不编译测试目标。** 只跑 `cargo build` 或 `cargo check --lib` 会漏掉
-   测试目标里的编译错误。里程碑门禁必须用 `--all-targets`。
+   测试目标里的编译错误，也会让"没在 `lib.rs` 里声明的模块"看起来是好的。
+   门禁必须用 `--all-targets`。见 `.omp/PITFALLS.md` **P-004**。
 2. **`cargo test --no-run` 失败时，磁盘上的测试二进制是陈旧的**，跑它得到的结论与当前代码无关。
    顺序永远是：先 `--no-run` 成功，再跑测试。
 3. **测试空转时不要重跑，用 `--test-threads=1`** 定位（最后打印的测试名就是卡住的那个），
-   然后 `--exact <名字>` 单独跑。本轮共 5 次因重跑挂死命令而整轮无进展。
+   然后 `--exact <名字>` 单独跑。
+4. **批量改写源码不要用 `Get-Content | Set-Content` 往返**，会破坏 UTF-8。见 **P-005**。
+   另外：终端里看到中文乱码**不能**证明文件坏了，要用码点检查。
 
 ### 验收工具已就绪
 

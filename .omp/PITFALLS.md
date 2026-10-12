@@ -14,6 +14,85 @@
 | **P-001** | **本机编译失败的真因是 `%TEMP%` 权限，不是编译器内存——旧项目据此错误地放弃了本机构建** | **全局，已解除** |
 | P-002 | PowerShell 把 cargo 的 stderr 当错误，构建成功也会得到 exit code 1 | 所有 cargo 命令 |
 | P-003 | 本机 MSVC 是 VS2019 (14.29) + SDK 19041，但完全够用 | 工具链 |
+| **P-004** | **`cargo build` / `check --lib` 不编译测试目标：改了结构体字段而没跑 `cargo test`，会以为自己是绿的** | **所有改动，已加门禁** |
+| **P-005** | **PowerShell 的 `Get-Content \| Set-Content` 往返会重写整个文件，破坏 UTF-8 与行尾；对源码做批量改写必须用 .NET 的 `ReadAllText`/`WriteAllText`** | **批量改写脚本** |
+
+---
+
+## P-004 · `cargo build` 是绿的，`cargo test` 连编译都过不了
+
+**现象**
+
+给 `TaskRecord` 加了一个字段 `name_hint` 之后，`cargo build` 与 `cargo check -p chua-engine --lib`
+都报 `Finished`，于是继续往下写。实际上 `cargo test` 根本编译不过：
+
+```
+error[E0063]: missing field `name_hint` in initializer of `model::TaskRecord`
+   --> crates\engine\src\events.rs:314:9
+```
+
+同样地，`lib.rs` 里少一行 `pub mod engine;` 时，`cargo check --lib` 也一直显示成功——
+那 40 KB 的 `engine/` 目录根本没有被编译过。
+
+**根因**
+
+`cargo build` 与 `cargo check --lib` 编译的是 **lib 目标**，不含 `#[cfg(test)]` 单元测试、
+`tests/` 集成测试与 example。测试目标里的构造器与主代码不同步时，这两条命令完全看不见。
+
+**处置**
+
+门禁改成三条一起跑，缺一不可：
+
+```powershell
+cargo build
+cargo test -p <crate> --no-run     # 先确认测试目标能编译
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+`--all-targets` 是关键：它把 test / example 目标纳入 lint 范围，所以 clippy 能抓住
+`cargo build` 抓不到的这类错误。
+
+**复发预防**
+
+1. **每加一个模块就先在 `lib.rs` 里声明再写**，否则写出来的代码一行都没被编译过。
+2. **改了任何结构体字段，立刻跑一次带 `--all-targets` 的命令**，不要等"写完再一起编"。
+3. 报告构建结果时，说清跑的是哪条命令；`cargo build` 通过 **不等于** 测试目标能编译。
+
+---
+
+## P-005 · PowerShell 文本往返会把源码改成乱码
+
+**现象**
+
+用 `Get-Content x.rs -Raw` 读出来、`-replace` 改一处、再 `Set-Content` 写回去之后，
+文件里所有非 ASCII 字符都变成了 `鈥` / `搂` 这样的乱码（`—` 与 `§` 全部损坏）。
+
+**根因**
+
+`Get-Content` 默认按系统 ANSI 代码页解码，`Set-Content` 再按同一代码页编码。
+UTF-8 源码经这一趟往返必然损坏。而且损坏之后**肉眼看 `Select-String` 的输出是不可靠的**：
+控制台本身的编码也会把正确的 UTF-8 显示成乱码（本项目里正确的 `§` 在终端里就显示成 `搂`），
+所以"看到乱码"不能证明文件坏了，反过来也一样。
+
+**判定办法**：不要看显示结果，直接看码点：
+
+```powershell
+$t = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($p))
+$t.ToCharArray() | Where-Object { [int]$_ -gt 126 } | ForEach-Object { "U+{0:X4}" -f [int]$_ } | Sort-Object -Unique
+```
+
+**处置 / 复发预防**
+
+批量改写源码一律走 .NET，并显式指定不带 BOM 的 UTF-8：
+
+```powershell
+$t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
+$t = $t.Replace($old, $new)
+[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))
+```
+
+能用 `edit` 工具的单点改动就用它，不要为了省事做整文件往返。
 
 ---
 

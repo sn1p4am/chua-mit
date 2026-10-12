@@ -199,8 +199,10 @@ impl EngineHandle {
         let (reply, wait) = oneshot::channel();
         if self.send(Command::Shutdown { reply }).await.is_ok() {
             // A closed reply channel means the actor finished first, which is
-            // equally fine.
-            let _ = wait.await;
+            // equally fine. The outcome is inspected rather than discarded.
+            if wait.await.is_err() {
+                tracing::debug!("actor stopped before acknowledging shutdown");
+            }
         }
     }
 
@@ -218,7 +220,7 @@ impl EngineHandle {
     }
 }
 
-enum Command {
+pub(crate) enum Command {
     Add {
         seed: Box<TaskSeed>,
         reply: oneshot::Sender<Result<TaskId, EngineError>>,
@@ -245,8 +247,6 @@ enum Command {
     },
     /// Internal: a worker changed something.
     Report(Box<JobReport>),
-    /// Internal: a task finished and its worker is gone.
-    WorkerGone(TaskId),
 }
 
 /// The engine. Owns the actor task.
@@ -460,10 +460,6 @@ impl Actor {
                 }
             }
             Command::Report(report) => self.apply_report(*report),
-            Command::WorkerGone(id) => {
-                self.workers.remove(&id);
-                self.jobs.remove(&id);
-            }
             Command::Shutdown { reply } => {
                 self.closing = true;
                 self.shutdown().await;
@@ -553,9 +549,7 @@ impl Actor {
         record.validators = probe.validators;
         record.updated_at = crate::http::now_unix();
 
-        if let Err(error) = self.apply_state(id, TaskState::Queued, None) {
-            return Err(EngineError::from(error));
-        }
+        self.apply_state(id, TaskState::Queued, None)?;
         self.persist(id);
         self.start_worker(id);
         Ok(id)
@@ -576,7 +570,10 @@ impl Actor {
                         return Err(failure);
                     }
                     let jitter = pseudo_random_unit(url.as_str(), attempt);
-                    match config.backoff.next_delay(attempt, failure.retry_after, jitter) {
+                    match config
+                        .backoff
+                        .next_delay(attempt, failure.retry_after, jitter)
+                    {
                         Some(delay) => {
                             tracing::debug!(
                                 attempt,
@@ -605,20 +602,35 @@ impl Actor {
     }
 
     fn view(&self, record: &TaskRecord) -> TaskView {
-        let pending = |segment: u32| self.pending_for(record.id, segment);
+        // The view folds durable and pending together to report `received_len`,
+        // which is what a progress indicator needs. `done_len` stays separate
+        // and only ever counts what the store has confirmed.
+        let in_flight = |segment: u32| self.in_flight_for(record.id, segment);
         let rate = self
             .jobs
             .get(&record.id)
             .map(|entry| entry.rate_window.last_rate_bps())
             .filter(|rate| *rate > 0);
-        TaskView::assemble(record, &pending, rate)
+        TaskView::assemble(record, &in_flight, rate)
     }
 
-    fn pending_for(&self, task: TaskId, segment: u32) -> u64 {
-        self.progress
+    /// Bytes belonging to one segment that are on disk: the durable prefix plus
+    /// whatever has been written since the last flush.
+    fn in_flight_for(&self, task: TaskId, segment: u32) -> u64 {
+        let Some(record) = self.records.get(&task) else {
+            return 0;
+        };
+        let durable = record
+            .segments
+            .iter()
+            .find(|candidate| candidate.id == segment)
+            .map_or(0, SegmentState::durable_len);
+        let pending = self
+            .progress
             .get(&task)
             .and_then(|board| board.lock().ok().map(|guard| guard.pending_for(segment)))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        durable.saturating_add(pending)
     }
 
     fn transition(&mut self, id: TaskId, to: TaskState) -> Result<TaskState, EngineError> {
@@ -864,9 +876,7 @@ impl Actor {
                 self.persist(id);
             }
             JobReportKind::Progress {
-                segments,
-                received,
-                ..
+                segments, received, ..
             } => {
                 {
                     let Some(record) = self.records.get_mut(&id) else {

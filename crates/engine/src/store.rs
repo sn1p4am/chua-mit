@@ -33,6 +33,13 @@ pub struct EngineSettings {
 
 impl Default for EngineSettings {
     fn default() -> Self {
+        Self::new_unlimited()
+    }
+}
+
+impl EngineSettings {
+    /// Settings with no global ceiling, which is §11's default.
+    pub const fn new_unlimited() -> Self {
         Self {
             global_rate_limit_bps: None,
         }
@@ -117,10 +124,7 @@ impl Store {
     /// Allocate the next task id. Persisted so ids are not reused after a
     /// restart, which keeps event and store ordering consistent.
     pub fn next_task_id(&mut self) -> Result<TaskId, Failure> {
-        let current = self
-            .read_meta_u64("next_task_id")?
-            .unwrap_or(1)
-            .max(1);
+        let current = self.read_meta_u64("next_task_id")?.unwrap_or(1).max(1);
         self.write_meta("next_task_id", &(current + 1).to_string())?;
         Ok(TaskId(current))
     }
@@ -156,7 +160,9 @@ impl Store {
                 record.state.as_str(),
                 record.source_label,
                 record.target_path.to_string_lossy(),
-                record.total_len.map(|len| i64::try_from(len).unwrap_or(i64::MAX)),
+                record
+                    .total_len
+                    .map(|len| i64::try_from(len).unwrap_or(i64::MAX)),
                 i64::from(record.range_supported),
                 record.validators.strong,
                 record.validators.weak,
@@ -275,10 +281,7 @@ impl Store {
                 target_path: std::path::PathBuf::from(target_path),
                 total_len: total_len.and_then(|len| u64::try_from(len).ok()),
                 range_supported: range_supported != 0,
-                validators: Validators {
-                    strong,
-                    weak,
-                },
+                validators: Validators { strong, weak },
                 segments: Vec::new(),
                 failure,
                 name_hint,
@@ -294,10 +297,7 @@ impl Store {
 
     /// Load one task, or `None` when it is not in the store.
     pub fn load_task(&self, id: TaskId) -> Result<Option<TaskRecord>, Failure> {
-        Ok(self
-            .load_all()?
-            .into_iter()
-            .find(|record| record.id == id))
+        Ok(self.load_all()?.into_iter().find(|record| record.id == id))
     }
 
     fn load_segments(&self, id: TaskId) -> Result<Vec<SegmentState>, Failure> {
@@ -309,14 +309,17 @@ impl Store {
             )
             .map_err(map_sqlite("prepare_load_segments"))?;
         let rows = statement
-            .query_map(params![i64::try_from(id.get()).unwrap_or(i64::MAX)], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            })
+            .query_map(
+                params![i64::try_from(id.get()).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
             .map_err(map_sqlite("load_segments"))?;
         let mut segments = Vec::new();
         for row in rows {
@@ -350,9 +353,11 @@ impl Store {
     fn read_meta_u64(&self, key: &str) -> Result<Option<u64>, Failure> {
         let raw: Option<String> = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(map_sqlite("read_meta"))?;
         Ok(raw.and_then(|value| value.parse::<u64>().ok()))
@@ -467,12 +472,10 @@ mod tests {
     fn failed_state_keeps_its_structured_reason() {
         let mut store = Store::open_in_memory().unwrap();
         let mut current = record(7, TaskState::Failed);
-        current.failure = Some(Failure::new(
-            FailureKind::SourceMissing,
-            FailureScope::Probe,
-            "http_404",
-        )
-        .with_status(404));
+        current.failure = Some(
+            Failure::new(FailureKind::SourceMissing, FailureScope::Probe, "http_404")
+                .with_status(404),
+        );
         store.save_task(&current).unwrap();
 
         let loaded = store.load_all().unwrap();

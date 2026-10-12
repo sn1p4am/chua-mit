@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderValue,
-    IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap,
+    HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
 };
 use reqwest::{Client, Response, StatusCode};
 
@@ -203,7 +203,11 @@ pub fn build_client() -> Result<Client, Failure> {
 /// A GET rather than a HEAD because the spec requires that range support be
 /// established from the actual response, and a HEAD response never carries a
 /// `Content-Range`. The body of the one-byte reply is dropped.
-pub async fn probe(client: &Client, url: &reqwest::Url, total_timeout: Duration) -> Result<ProbeOutcome, Failure> {
+pub async fn probe(
+    client: &Client,
+    url: &reqwest::Url,
+    total_timeout: Duration,
+) -> Result<ProbeOutcome, Failure> {
     let request = client
         .get(url.clone())
         .header(RANGE, range_header_value(0, 0));
@@ -287,7 +291,11 @@ pub fn interpret_probe(response: Response) -> Result<ProbeOutcome, Failure> {
 }
 
 /// Map a non-success status onto a failure class. Returns `None` for 2xx.
-pub fn status_failure(status: StatusCode, headers: &HeaderMap, scope: FailureScope) -> Option<Failure> {
+pub fn status_failure(
+    status: StatusCode,
+    headers: &HeaderMap,
+    scope: FailureScope,
+) -> Option<Failure> {
     if status.is_success() {
         return None;
     }
@@ -326,19 +334,17 @@ pub fn now_unix() -> u64 {
 
 /// Map a transport error onto a failure class.
 ///
-/// Order matters: the most specific signals are tested first, because a
-/// request can be both "a connect error" and "a timeout".
+/// The buckets are collapsed into a single expression on purpose: timeouts,
+/// connect failures and dropped connections are all the same class, because the
+/// host's remedy for each is the same — wait and try again. Body and redirect
+/// problems are `DataMismatch` because the response did not deliver what the
+/// request asked for, which is the class whose remedy is a re-probe rather than
+/// a blind retry.
 pub fn classify(error: &reqwest::Error, scope: FailureScope, detail: &str) -> Failure {
-    let kind = if error.is_timeout() {
-        FailureKind::TransportReset
-    } else if error.is_connect() {
-        FailureKind::TransportReset
-    } else if error.is_body() || error.is_decode() {
+    let kind = if error.is_body() || error.is_decode() || error.is_redirect() {
         FailureKind::DataMismatch
-    } else if error.is_redirect() {
-        FailureKind::DataMismatch
-    } else if error.is_builder() {
-        FailureKind::Unknown
+    } else if error.is_timeout() || error.is_connect() {
+        FailureKind::TransportReset
     } else {
         FailureKind::Unknown
     };
@@ -355,7 +361,9 @@ pub fn classify_io(error: &std::io::Error, detail: &str) -> Failure {
     let kind = match error.kind() {
         std::io::ErrorKind::StorageFull => FailureKind::DiskFull,
         std::io::ErrorKind::PermissionDenied => FailureKind::DiskOther,
-        std::io::ErrorKind::InvalidFilename | std::io::ErrorKind::NotFound => FailureKind::DiskOther,
+        std::io::ErrorKind::InvalidFilename | std::io::ErrorKind::NotFound => {
+            FailureKind::DiskOther
+        }
         _ => {
             // Windows reports the out-of-space condition as ERROR_DISK_FULL
             // (112) or ERROR_HANDLE_DISK_FULL (39) on some paths.
@@ -409,7 +417,10 @@ mod tests {
         assert_eq!(range.len(), 1024);
 
         let range = parse_content_range("bytes 100-199/*").unwrap();
-        assert_eq!((range.start, range.end, range.complete_len), (100, 199, None));
+        assert_eq!(
+            (range.start, range.end, range.complete_len),
+            (100, 199, None)
+        );
 
         let range = parse_content_range("BYTES 5-5/10").unwrap();
         assert_eq!(range.len(), 1);
@@ -436,7 +447,10 @@ mod tests {
             parse_retry_after("120", 1_000),
             Some(Duration::from_secs(120))
         );
-        assert_eq!(parse_retry_after(" 7 ", 1_000), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after(" 7 ", 1_000),
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]

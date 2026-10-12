@@ -215,10 +215,7 @@ mod tests {
     #[test]
     fn every_legal_transition_is_accepted() {
         for (from, to) in LEGAL {
-            assert!(
-                from.can_transition_to(to),
-                "{from} -> {to} should be legal"
-            );
+            assert!(from.can_transition_to(to), "{from} -> {to} should be legal");
             assert!(check_transition(from, to).is_ok());
         }
     }

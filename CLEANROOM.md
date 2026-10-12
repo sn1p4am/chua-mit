@@ -142,3 +142,28 @@ grep -rnE 'tdmfast[\\/]chua|\.chua-verify' crates/ spec/
 
 **说明**：本表只列真实存在的文件。M1 交付时由规格侧逐项复核（复核清单见 `.omp/TODO.md`），
 但**表格的填写权属实现侧**——规格侧代填会让这份记录失去作为来源证据的意义。
+
+### 8.1 追加（同一实现会话，续）
+
+**依据的规格版本补充**：`engine-v1.md` **v1.0.1**（§4.2 澄清：含路径的候选名取末段而非拼接）。
+实现侧在 v1.0.1 发布后按其改写了 `filename.rs` 的净化顺序，并同步修正了原先编码了拼接读法的两个用例。
+
+| 文件 | 实现会话 | 依据规格 | 接触过上游源码 |
+|---|---|---|---|
+| `crates/engine/src/store.rs` | `implement-m1-engine-slice` | §7.1、§7.2（原子落盘）、§7.3 | **否** |
+| `crates/engine/src/engine/mod.rs` | 同上 | §3.2、§7.3(2)、§9.4、§10、ADR-0004 | **否** |
+| `crates/engine/src/engine/persist.rs` | 同上 | §7.2（单一写入者） | **否** |
+| `crates/engine/src/engine/job.rs` | 同上 | §4、§6、§7.3、§8.3 | **否** |
+| `crates/engine/src/engine/transfer.rs` | 同上 | §6.3（区间校验）、§6.4（按偏移写入） | **否** |
+| `crates/engine/src/engine/ranges.rs` | 同上 | §6.3（**最危险的一类错误**的专门分支） | **否** |
+| `crates/engine/src/engine/throttle.rs` | 同上 | §9.1、§9.2（**配速部分未实现**，见 `.omp/PITFALLS.md` P-004） | **否** |
+| `crates/engine/DEPENDENCIES.md` | 同上 | ADR-0005、ADR-0008 | **否** |
+
+`crates/cli/**` 与本地 range server **未创建**，原因与本轮已知缺陷一并记在 `.omp/TODO.md`。
+
+### 8.2 追加：会话日志（§7 续行）
+
+| 日期 | 会话标识 | 侧 | 读过上游源码 | 输入 | 产出 |
+|---|---|---|---|---|---|
+| 2026-10-12 | `implement-m1-engine-slice`（子代理） | **干净侧** | **否** —— 只读了 `spec/engine-v1.md`、`spec/cli-v1.md`、`CLEANROOM.md`、`AGENTS.md`、`.omp/` 下的文档，以及公开的 crate 源码（`reqwest` 的本地 registry 副本）；任务书明确禁止读写 `chua/`、`app/`、`tamper-test/`、`.chua-verify` | M1 slice 1 任务书 | `Cargo.toml`、`rustfmt.toml`、`crates/engine/**`（16 个源文件，lib 129 测试通过 / 5 忽略） |
+

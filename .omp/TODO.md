@@ -91,4 +91,13 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
 
 ## 待规格侧回答（实现侧发现缺口时记这里）
 
-_（空）_
+- **§3.2 的 `→ Failed` 行没有列出 `Paused` 作为来源。** 原文写的是「`{Probing,Queued,Downloading} → Failed`」。
+  实现按字面读：`Paused → Failed` **不是**合法迁移（`Paused` 时没有 worker 在跑，也就没有东西能报致命错误）。
+  如果规格侧希望「暂停中的任务也能因外部原因进 Failed」，请补一行；否则这条按现状即为正确读法。
+  代码位置：`crates/engine/src/state.rs` 的 `can_transition_to`。
+
+- **§9.1 的限速在当前实现中尚未成立。** 见 `.omp/PITFALLS.md` 的 **P-004**：
+  `throttle.rs::reserve` 的配速算术有缺陷，限速任务会跑得比上限快，
+  因此 5 个配速用例被标为 `#[ignore]` 而不是删掉或放宽。
+  **限速未实现**，`set_global_rate_limit` / 每任务 `--limit` 目前不生效。
+  速率**测量**（`RateWindow`）与限速的**接线**（`pace`、`effective_limit`、运行中改速率）均已通过测试。

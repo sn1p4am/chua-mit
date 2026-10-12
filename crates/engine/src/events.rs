@@ -86,23 +86,45 @@ pub struct TaskView {
 impl TaskView {
     /// Assemble a view from the durable record, live per-segment pending counts,
     /// and the current rate estimate.
+    ///
+    /// `on_disk` answers "how many of this segment's bytes are on the file",
+    /// which is the durable prefix plus anything written since the last flush.
+    /// Folding the two together is what lets `received_len` move between flush
+    /// ticks while `done_len` stays conservative.
     pub fn assemble(
         record: &TaskRecord,
-        pending: &dyn Fn(u32) -> u64,
+        on_disk: &dyn Fn(u32) -> u64,
         rate_bps: Option<u64>,
     ) -> Self {
         let segments: Vec<SegmentView> = record
             .segments
             .iter()
             .map(|segment| {
-                SegmentView::from_state(segment, pending(segment.id), &record.source_label)
+                let on_disk = on_disk(segment.id);
+                let durable = segment.durable_len();
+                SegmentView {
+                    id: segment.id,
+                    start: segment.start,
+                    end: segment.end,
+                    done_len: durable,
+                    pending_len: on_disk.saturating_sub(durable),
+                    source_label: record.source_label.clone(),
+                }
             })
             .collect();
         let done_len = record.durable_len();
-        let received_len = segments
+        // `received_len` is what a progress indicator should show, so it is
+        // capped at the total: bytes past `total_len` are never part of the file,
+        // and letting them through would make the progress bar run backwards as
+        // the ETA computation saw a negative remainder.
+        let on_disk_total: u64 = segments
             .iter()
             .map(|segment| segment.done_len.saturating_add(segment.pending_len))
             .sum();
+        let received_len = match record.total_len {
+            Some(total) => on_disk_total.min(total),
+            None => on_disk_total,
+        };
         Self {
             id: record.id,
             state: record.state,
@@ -362,23 +384,30 @@ mod tests {
 
     #[test]
     fn eta_refuses_to_guess_from_a_weak_signal() {
-        let record = record(vec![SegmentState::new(0, 0, 999_999)], Some(1_000_000));
+        let task = record(vec![SegmentState::new(0, 0, 999_999)], Some(1_000_000));
         // No rate at all.
-        assert_eq!(TaskView::assemble(&record, &|_| 0, None).eta_secs, None);
+        assert_eq!(TaskView::assemble(&task, &|_| 0, None).eta_secs, None);
         // Rate too low to extrapolate.
-        assert_eq!(
-            TaskView::assemble(&record, &|_| 0, Some(10)).eta_secs,
-            None
+        assert_eq!(TaskView::assemble(&task, &|_| 0, Some(10)).eta_secs, None);
+        // Absurd remaining time: an exabyte at 1 kB/s is far past the ceiling,
+        // so the answer is "unknown" rather than a number nobody can use.
+        let huge = record(
+            vec![SegmentState::new(0, 0, 999_999)],
+            Some(1_000_000_000_000),
         );
-        // Absurd remaining time.
+        assert_eq!(TaskView::assemble(&huge, &|_| 0, Some(1000)).eta_secs, None);
+        // A sane rate produces a number: 1 MB remaining at 100 kB/s.
         assert_eq!(
-            TaskView::assemble(&record, &|_| 0, Some(2048)).eta_secs,
-            None
+            TaskView::assemble(&task, &|_| 0, Some(100_000)).eta_secs,
+            Some(10)
         );
-        // A sane rate produces a number.
+        // Nothing left to fetch reports zero rather than a guess.
+        let mut finished = SegmentState::new(0, 0, 999_999);
+        finished.mark_durable_through(999_999);
+        let done = record(vec![finished], Some(1_000_000));
         assert_eq!(
-            TaskView::assemble(&record, &|_| 0, Some(100_000)).eta_secs,
-            Some(9)
+            TaskView::assemble(&done, &|_| 1_000_000, Some(4096)).eta_secs,
+            Some(0)
         );
     }
 
@@ -404,7 +433,11 @@ mod tests {
     fn snapshot_lookup_and_counting() {
         let snapshot = Snapshot {
             tasks: vec![
-                TaskView::assemble(&record(vec![SegmentState::new(0, 0, 9)], Some(10)), &|_| 0, None),
+                TaskView::assemble(
+                    &record(vec![SegmentState::new(0, 0, 9)], Some(10)),
+                    &|_| 0,
+                    None,
+                ),
                 TaskView::assemble(
                     &TaskRecord {
                         id: TaskId(5),
@@ -432,7 +465,10 @@ mod tests {
         assert!(throttle.allows(Some(start), start + Duration::from_millis(100)));
         assert!(throttle.allows(Some(start), start + Duration::from_secs(1)));
         // Zero hertz degrades to 1 Hz rather than dividing by zero.
-        assert_eq!(ProgressThrottle::new(0).min_interval(), Duration::from_secs(1));
+        assert_eq!(
+            ProgressThrottle::new(0).min_interval(),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
