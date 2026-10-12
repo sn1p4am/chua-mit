@@ -63,8 +63,12 @@ $env:TMP = "E:\dsh-workspace\tdmfast\.tmp-build"; $env:TEMP = $env:TMP
     - [x] 判定逻辑本身**已确认正确**：`engine/ranges.rs` 的 `RangeVerdict` 把
           「200 且请求的就是整个文件」与「200 但请求的是部分区间」分开，
           后者一律拒绝；未知长度模式（§4.3）下允许 200，处理得比规格要求更细
-    - [ ] 仍需确认**传输循环确实只走这条路径**（模块文档声称 "the transfer loop has no
-          path that bypasses it"，但循环尚未落地，需要看代码而不是看注释）
+    - [x] **传输循环确实走这条路径**（已读代码确认）：`transfer.rs:263` 调用
+          `validate_range_response`，`:264` 用 `verdict_failure` 转成失败；
+          全文件**只有一个写入点**（`:396` 的 `write_all`），且它接收的是已校验过的偏移，
+          模块文档声称的「no second path to the file」与代码一致
+    - [ ] 端到端跑一次：起一个对 Range 请求回 `200` + 整份文件的本地服务器，
+          断言引擎报错而**不是**写出一个损坏文件（等 CLI 落地后做）
   - [ ] 复核 `done_len` 只统计已持久化字节（§7.3），而非已接收字节
   - [ ] **复核「重启后 `Downloading` 必须回到 `Queued`」这条规则在哪里落实**（§7.3 第 2 条）。
         `store.rs` 只负责存取，该规则应由启动路径应用；确认它确实存在且有测试，
