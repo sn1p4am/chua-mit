@@ -168,31 +168,44 @@ spike 位于仓库外 `../.gpui-spike`（不产生入库产物，故不受干净
 | §6.1 分段超限必须拒绝而非截断 | `HARD_MAX_SEGMENTS = 64`，超限报错 |
 | §12 每段内存与文件大小无关 | `CHUNK_BYTES = 64 KiB` |
 
-### 当前阻塞（**交付物尚不可用**）—— 快照 @ 第 59 轮
+### 当前状态（**交付物尚不可用**）—— 自动轮次结束时的交接
 
-**已解决的**：`Actor: Sync`（改用 `Mutex<Store>`）、`watch` 通道传反、
-`ranges.rs:60` 整数溢出（哨兵值显式处理）、`Content-Disposition` 取末段规则、
-两个原始挂死。
+**M0 已完成并验证。M1 未完成。**
 
-**进行中**：`throttle.rs` 的 `claim()` 正在按「单次强 CAS 推进时间线」重构
-（该函数已三次出问题，故不再打补丁）。重构进行中，**当前 crate 编译不过**：
-`error[E0599]: no method named queue_for found for struct throttle::TokenBucket`（6 处）——
-调用方仍在使用被移除/改名的方法。
+**已解决**（全部经实跑确认）：`Actor: Sync`（改 `Mutex<Store>`）、`watch` 通道传反、
+`ranges.rs:60` 整数溢出、`Content-Disposition` 取末段规则、两个原始挂死。
 
-> ⚠️ **验证陷阱**：重构期间 `cargo test --no-run` 会失败，磁盘上的测试二进制因此是**陈旧的**。
-> 此时跑测试得到的任何结论都与当前代码无关。**必须先用 `--no-run` 确认构建成功，再跑测试。**
+**结束时仍有**：
 
-**待办（按优先级）**：
-1. crate 能编译
-2. 无测试空转
-3. 4 个失败用例：`throttle::a_faster_rate_shortens_the_wait`、
-   `events::eta_refuses_to_guess_from_a_weak_signal`、`filename::mixed_encoding_names`（v1.0.2 解码顺序）、
-   `job::prepare_target_truncates_to_the_confirmed_count`
-4. `cargo clippy --workspace --all-targets -- -D warnings` —— 2 个 error 均为 `AGENTS.md` §5 禁止的写法
-   （`throttle.rs:229` 的 `.ok()`、`engine/mod.rs:203` 的 `let _ = wait.await;`）+ 14 warning
-5. `cargo fmt --all` —— `config.rs:291`、`engine/job.rs:101/218/655/686` 等
-6. `crates/cli`（接口见 `spec/cli-v1.md`）—— 验收套件的最后一道门
-7. 拆分 `engine/mod.rs`（974 行）、`engine/job.rs`（约 1000 行），`AGENTS.md` §5 指引为 600 行
+1. **测试仍会空转**（最后一次实测：120 秒未结束）
+2. **`job.rs` 的 6 个用例失败**（该文件在结束时仍在被修改，故这是瞬时值）：
+   `flush_marks_pending_bytes_durable`、`prepare_target_extends_an_exactly_matching_file`、
+   `prepare_target_preallocates_and_reports_durable_bytes`、
+   `prepare_target_truncates_to_the_confirmed_count`、
+   `prepare_target_trusts_the_smaller_of_store_and_file`、`reset_target_empties_the_file`
+3. **`crates/cli` 未创建** —— 验收套件因此无法运行（接口见 `spec/cli-v1.md`）
+4. clippy 2 error + 14 warning；`cargo fmt --all --check` 不干净
+
+**一处需要判断的设计冲突**（值得下一个接手者先想清楚）：
+`prepare_target_*` 这组测试同时要求「预分配并报告 durable 字节」与
+「不得缩短已存在的文件」，而另一个测试要求「truncate 到已确认的计数」。
+这三点可以同时成立，但需要把**引擎自己的半成品文件**与**任务开始前就存在的用户文件**
+区分开（§I3 与 §7.3(5)、§7.4 的交界）。实现侧目前在这条边界上来回改，
+建议先把这个区分明确成代码里的两个分支，再调其他参数。
+
+### ⚠️ 验证陷阱（会再踩，务必先读）
+
+1. **`cargo build` 不编译测试目标。** 只跑 `cargo build` 或 `cargo check --lib` 会漏掉
+   测试目标里的编译错误。里程碑门禁必须用 `--all-targets`。
+2. **`cargo test --no-run` 失败时，磁盘上的测试二进制是陈旧的**，跑它得到的结论与当前代码无关。
+   顺序永远是：先 `--no-run` 成功，再跑测试。
+3. **测试空转时不要重跑，用 `--test-threads=1`** 定位（最后打印的测试名就是卡住的那个），
+   然后 `--exact <名字>` 单独跑。本轮共 5 次因重跑挂死命令而整轮无进展。
+
+### 验收工具已就绪
+
+`spec/acceptance/`（服务器 7 种模式 + 6 项检查）已自测通过。
+CLI 一落地即可 `python run.py --cli ...` 得到 M1 的真实结论。
 
 ### 验收工具已就绪
 
