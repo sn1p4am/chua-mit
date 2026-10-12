@@ -1,0 +1,21 @@
+# 文本一律以 LF 入库，并在工作区保持 LF（跨平台一致，避免 diff 噪声）
+* text=auto eol=lf
+
+# 二进制：不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.exe binary
+*.dll binary
+*.pdb binary
+*.lib binary
+
+# 生成物：不参与语言统计与 diff 折叠
+Cargo.lock linguist-generated
+bun.lock linguist-generated

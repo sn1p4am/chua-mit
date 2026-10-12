@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/target/
+*.pdb
+*.rlib
+*.rmeta
+
+# Node / web assets
+node_modules/
+dist/
+.vite/
+
+# Build & packaging output
+/build/
+/artifacts/
+*.exe
+*.msi
+*.dll
+*.app
+
+# Local scratch (never committed)
+/tmp/
+/scratch/
+*.local.*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
